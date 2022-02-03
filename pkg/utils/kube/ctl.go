@@ -3,6 +3,8 @@ package kube
 import (
 	"context"
 	"fmt"
+	"github.com/argoproj/gitops-engine/pkg/utils/tracing"
+	"github.com/opentracing/opentracing-go"
 	"io/ioutil"
 
 	"github.com/go-logr/logr"
@@ -17,7 +19,6 @@ import (
 	"k8s.io/kubectl/pkg/util/openapi"
 
 	utils "github.com/argoproj/gitops-engine/pkg/utils/io"
-	"github.com/argoproj/gitops-engine/pkg/utils/tracing"
 )
 
 type CleanupFunc func()
@@ -39,7 +40,6 @@ type Kubectl interface {
 
 type KubectlCmd struct {
 	Log          logr.Logger
-	Tracer       tracing.Tracer
 	OnKubectlRun OnKubectlRunFunc
 }
 
@@ -120,8 +120,6 @@ func (k *KubectlCmd) LoadOpenAPISchema(config *rest.Config) (openapi.Resources, 
 }
 
 func (k *KubectlCmd) GetAPIResources(config *rest.Config, preferred bool, resourceFilter ResourceFilter) ([]APIResourceInfo, error) {
-	span := k.Tracer.StartSpan("GetAPIResources")
-	defer span.Finish()
 	apiResIfs, err := k.filterAPIResources(config, preferred, resourceFilter, func(apiResource *metav1.APIResource) bool {
 		return isSupportedVerb(apiResource, listVerb) && isSupportedVerb(apiResource, watchVerb)
 	})
@@ -133,9 +131,11 @@ func (k *KubectlCmd) GetAPIResources(config *rest.Config, preferred bool, resour
 
 // GetResource returns resource
 func (k *KubectlCmd) GetResource(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string) (*unstructured.Unstructured, error) {
-	span := k.Tracer.StartSpan("GetResource")
-	span.SetBaggageItem("kind", gvk.Kind)
-	span.SetBaggageItem("name", name)
+	span, ctx := tracing.StartSpan(ctx, "KubectlCmd.GetResource", opentracing.Tags{
+		"gvk":       gvk.String(),
+		"name":      name,
+		"namespace": namespace,
+	})
 	defer span.Finish()
 	dynamicIf, err := dynamic.NewForConfig(config)
 	if err != nil {
@@ -156,9 +156,11 @@ func (k *KubectlCmd) GetResource(ctx context.Context, config *rest.Config, gvk s
 
 // PatchResource patches resource
 func (k *KubectlCmd) PatchResource(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string, patchType types.PatchType, patchBytes []byte, subresources ...string) (*unstructured.Unstructured, error) {
-	span := k.Tracer.StartSpan("PatchResource")
-	span.SetBaggageItem("kind", gvk.Kind)
-	span.SetBaggageItem("name", name)
+	span, ctx := tracing.StartSpan(ctx, "KubectlCmd.PatchResource", opentracing.Tags{
+		"gvk":       gvk.String(),
+		"name":      name,
+		"namespace": namespace,
+	})
 	defer span.Finish()
 	dynamicIf, err := dynamic.NewForConfig(config)
 	if err != nil {
@@ -179,9 +181,11 @@ func (k *KubectlCmd) PatchResource(ctx context.Context, config *rest.Config, gvk
 
 // DeleteResource deletes resource
 func (k *KubectlCmd) DeleteResource(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string, deleteOptions metav1.DeleteOptions) error {
-	span := k.Tracer.StartSpan("DeleteResource")
-	span.SetBaggageItem("kind", gvk.Kind)
-	span.SetBaggageItem("name", name)
+	span, ctx := tracing.StartSpan(ctx, "KubectlCmd.DeleteResource", opentracing.Tags{
+		"gvk":       gvk.String(),
+		"name":      name,
+		"namespace": namespace,
+	})
 	defer span.Finish()
 	dynamicIf, err := dynamic.NewForConfig(config)
 	if err != nil {
@@ -223,7 +227,6 @@ func (k *KubectlCmd) ManageResources(config *rest.Config, openAPISchema openapi.
 		config:        config,
 		fact:          fact,
 		openAPISchema: openAPISchema,
-		tracer:        k.Tracer,
 		log:           k.Log,
 		onKubectlRun:  k.OnKubectlRun,
 	}, cleanup, nil
@@ -231,11 +234,7 @@ func (k *KubectlCmd) ManageResources(config *rest.Config, openAPISchema openapi.
 
 // ConvertToVersion converts an unstructured object into the specified group/version
 func (k *KubectlCmd) ConvertToVersion(obj *unstructured.Unstructured, group string, version string) (*unstructured.Unstructured, error) {
-	span := k.Tracer.StartSpan("ConvertToVersion")
 	from := obj.GroupVersionKind().GroupVersion()
-	span.SetBaggageItem("from", from.String())
-	span.SetBaggageItem("to", schema.GroupVersion{Group: group, Version: version}.String())
-	defer span.Finish()
 	if from.Group == group && from.Version == version {
 		return obj.DeepCopy(), nil
 	}
@@ -243,8 +242,6 @@ func (k *KubectlCmd) ConvertToVersion(obj *unstructured.Unstructured, group stri
 }
 
 func (k *KubectlCmd) GetServerVersion(config *rest.Config) (string, error) {
-	span := k.Tracer.StartSpan("GetServerVersion")
-	defer span.Finish()
 	client, err := discovery.NewDiscoveryClientForConfig(config)
 	if err != nil {
 		return "", err

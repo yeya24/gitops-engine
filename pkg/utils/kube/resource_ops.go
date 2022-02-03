@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/opentracing/opentracing-go"
 	"io/ioutil"
 	"strings"
 
@@ -31,7 +32,6 @@ import (
 
 	"github.com/argoproj/gitops-engine/pkg/diff"
 	"github.com/argoproj/gitops-engine/pkg/utils/io"
-	"github.com/argoproj/gitops-engine/pkg/utils/tracing"
 )
 
 // ResourceOperations provides methods to manage k8s resources
@@ -45,7 +45,7 @@ type ResourceOperations interface {
 type kubectlResourceOperations struct {
 	config        *rest.Config
 	log           logr.Logger
-	tracer        tracing.Tracer
+	tracer        opentracing.Tracer
 	onKubectlRun  OnKubectlRunFunc
 	fact          cmdutil.Factory
 	openAPISchema openapi.Resources

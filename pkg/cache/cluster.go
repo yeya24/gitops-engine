@@ -3,6 +3,8 @@ package cache
 import (
 	"context"
 	"fmt"
+	"github.com/argoproj/gitops-engine/pkg/utils/tracing"
+	"github.com/opentracing/opentracing-go"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -28,7 +30,6 @@ import (
 	"k8s.io/kubectl/pkg/util/openapi"
 
 	"github.com/argoproj/gitops-engine/pkg/utils/kube"
-	"github.com/argoproj/gitops-engine/pkg/utils/tracing"
 )
 
 const (
@@ -99,13 +100,13 @@ type ClusterCache interface {
 	// FindResources returns resources that matches given list of predicates from specified namespace or everywhere if specified namespace is empty
 	FindResources(namespace string, predicates ...func(r *Resource) bool) map[kube.ResourceKey]*Resource
 	// IterateHierarchy iterates resource tree starting from the specified top level resource and executes callback for each resource in the tree
-	IterateHierarchy(key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource))
+	IterateHierarchy(ctx context.Context, key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource))
 	// IsNamespaced answers if specified group/kind is a namespaced resource API or not
 	IsNamespaced(gk schema.GroupKind) (bool, error)
 	// GetManagedLiveObjs helps finding matching live K8S resources for a given resources list.
 	// The function returns all resources from cache for those `isManaged` function returns true and resources
 	// specified in targetObjs list.
-	GetManagedLiveObjs(targetObjs []*unstructured.Unstructured, isManaged func(r *Resource) bool) (map[kube.ResourceKey]*unstructured.Unstructured, error)
+	GetManagedLiveObjs(ctx context.Context, targetObjs []*unstructured.Unstructured, isManaged func(r *Resource) bool) (map[kube.ResourceKey]*unstructured.Unstructured, error)
 	// GetClusterInfo returns cluster cache statistics
 	GetClusterInfo() ClusterInfo
 	// OnResourceUpdated register event handler that is executed every time when resource get's updated in the cache
@@ -133,8 +134,7 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 		nsIndex:            make(map[string]map[kube.ResourceKey]*Resource),
 		config:             config,
 		kubectl: &kube.KubectlCmd{
-			Log:    log,
-			Tracer: tracing.NopTracer{},
+			Log: log,
 		},
 		syncStatus: clusterCacheSync{
 			resyncTimeout: defaultClusterResyncTimeout,
@@ -777,7 +777,10 @@ func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Res
 }
 
 // IterateHierarchy iterates resource tree starting from the specified top level resource and executes callback for each resource in the tree
-func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource)) {
+func (c *clusterCache) IterateHierarchy(ctx context.Context, key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource)) {
+	span, ctx := tracing.StartSpan(ctx, "clusterCache.IterateHierarchy", opentracing.Tags{"key": key.String()})
+	defer span.Finish()
+
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 	if res, ok := c.resources[key]; ok {
@@ -789,6 +792,7 @@ func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resour
 				childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
 			}
 		}
+		span, ctx = tracing.StartSpan(ctx, "iterate children", opentracing.Tags{"children": len(childrenByUID), "key": key.String()})
 		// make sure children has no duplicates
 		for _, children := range childrenByUID {
 			if len(children) > 0 {
@@ -810,6 +814,7 @@ func (c *clusterCache) IterateHierarchy(key kube.ResourceKey, action func(resour
 				})
 			}
 		}
+		span.Finish()
 	}
 }
 
@@ -833,7 +838,10 @@ func (c *clusterCache) managesNamespace(namespace string) bool {
 // GetManagedLiveObjs helps finding matching live K8S resources for a given resources list.
 // The function returns all resources from cache for those `isManaged` function returns true and resources
 // specified in targetObjs list.
-func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructured, isManaged func(r *Resource) bool) (map[kube.ResourceKey]*unstructured.Unstructured, error) {
+func (c *clusterCache) GetManagedLiveObjs(ctx context.Context, targetObjs []*unstructured.Unstructured, isManaged func(r *Resource) bool) (map[kube.ResourceKey]*unstructured.Unstructured, error) {
+	span, ctx := tracing.StartSpan(ctx, "clusterCache.GetManagedLiveObjs")
+	defer span.Finish()
+
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
@@ -869,7 +877,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 					managedObj = existingObj.Resource
 				} else {
 					var err error
-					managedObj, err = c.kubectl.GetResource(context.TODO(), c.config, targetObj.GroupVersionKind(), existingObj.Ref.Name, existingObj.Ref.Namespace)
+					managedObj, err = c.kubectl.GetResource(ctx, c.config, targetObj.GroupVersionKind(), existingObj.Ref.Name, existingObj.Ref.Namespace)
 					if err != nil {
 						if errors.IsNotFound(err) {
 							return nil
@@ -879,7 +887,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 				}
 			} else if _, watched := c.apisMeta[key.GroupKind()]; !watched {
 				var err error
-				managedObj, err = c.kubectl.GetResource(context.TODO(), c.config, targetObj.GroupVersionKind(), targetObj.GetName(), targetObj.GetNamespace())
+				managedObj, err = c.kubectl.GetResource(ctx, c.config, targetObj.GroupVersionKind(), targetObj.GetName(), targetObj.GetNamespace())
 				if err != nil {
 					if errors.IsNotFound(err) {
 						return nil
@@ -894,7 +902,7 @@ func (c *clusterCache) GetManagedLiveObjs(targetObjs []*unstructured.Unstructure
 			if err != nil {
 				// fallback to loading resource from kubernetes if conversion fails
 				c.log.V(1).Info(fmt.Sprintf("Failed to convert resource: %v", err))
-				managedObj, err = c.kubectl.GetResource(context.TODO(), c.config, targetObj.GroupVersionKind(), managedObj.GetName(), managedObj.GetNamespace())
+				managedObj, err = c.kubectl.GetResource(ctx, c.config, targetObj.GroupVersionKind(), managedObj.GetName(), managedObj.GetNamespace())
 				if err != nil {
 					if errors.IsNotFound(err) {
 						return nil
