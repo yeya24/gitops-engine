@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/argoproj/gitops-engine/pkg/utils/tracing"
 	"github.com/opentracing/opentracing-go"
 	"io/ioutil"
 	"strings"
@@ -45,7 +46,6 @@ type ResourceOperations interface {
 type kubectlResourceOperations struct {
 	config        *rest.Config
 	log           logr.Logger
-	tracer        opentracing.Tracer
 	onKubectlRun  OnKubectlRunFunc
 	fact          cmdutil.Factory
 	openAPISchema openapi.Resources
@@ -140,9 +140,7 @@ func kubeCmdFactory(kubeconfig, ns string) cmdutil.Factory {
 }
 
 func (k *kubectlResourceOperations) ReplaceResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, force bool) (string, error) {
-	span := k.tracer.StartSpan("ReplaceResource")
-	span.SetBaggageItem("kind", obj.GetKind())
-	span.SetBaggageItem("name", obj.GetName())
+	span, ctx := tracing.StartSpan(ctx, "kubectlResourceOperations.ReplaceResource", opentracing.Tags{"kind": obj.GetKind(), "name": obj.GetName()})
 	defer span.Finish()
 	k.log.Info(fmt.Sprintf("Replacing resource %s/%s in cluster: %s, namespace: %s", obj.GetKind(), obj.GetName(), k.config.Host, obj.GetNamespace()))
 	return k.runResourceCommand(ctx, obj, dryRunStrategy, func(f cmdutil.Factory, ioStreams genericclioptions.IOStreams, fileName string) error {
@@ -161,10 +159,7 @@ func (k *kubectlResourceOperations) ReplaceResource(ctx context.Context, obj *un
 }
 
 func (k *kubectlResourceOperations) CreateResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, validate bool) (string, error) {
-	gvk := obj.GroupVersionKind()
-	span := k.tracer.StartSpan("CreateResource")
-	span.SetBaggageItem("kind", gvk.Kind)
-	span.SetBaggageItem("name", obj.GetName())
+	span, ctx := tracing.StartSpan(ctx, "kubectlResourceOperations.CreateResource", opentracing.Tags{"kind": obj.GetKind(), "name": obj.GetName()})
 	defer span.Finish()
 	return k.runResourceCommand(ctx, obj, dryRunStrategy, func(f cmdutil.Factory, ioStreams genericclioptions.IOStreams, fileName string) error {
 		cleanup, err := k.processKubectlRun("create")
@@ -192,9 +187,7 @@ func (k *kubectlResourceOperations) CreateResource(ctx context.Context, obj *uns
 
 func (k *kubectlResourceOperations) UpdateResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy) (*unstructured.Unstructured, error) {
 	gvk := obj.GroupVersionKind()
-	span := k.tracer.StartSpan("UpdateResource")
-	span.SetBaggageItem("kind", gvk.Kind)
-	span.SetBaggageItem("name", obj.GetName())
+	span, ctx := tracing.StartSpan(ctx, "kubectlResourceOperations.UpdateResource", opentracing.Tags{"kind": obj.GetKind(), "name": obj.GetName()})
 	defer span.Finish()
 	dynamicIf, err := dynamic.NewForConfig(k.config)
 	if err != nil {
@@ -221,9 +214,7 @@ func (k *kubectlResourceOperations) UpdateResource(ctx context.Context, obj *uns
 
 // ApplyResource performs an apply of a unstructured resource
 func (k *kubectlResourceOperations) ApplyResource(ctx context.Context, obj *unstructured.Unstructured, dryRunStrategy cmdutil.DryRunStrategy, force, validate bool) (string, error) {
-	span := k.tracer.StartSpan("ApplyResource")
-	span.SetBaggageItem("kind", obj.GetKind())
-	span.SetBaggageItem("name", obj.GetName())
+	span, ctx := tracing.StartSpan(ctx, "kubectlResourceOperations.ApplyResource", opentracing.Tags{"kind": obj.GetKind(), "name": obj.GetName()})
 	defer span.Finish()
 	k.log.Info(fmt.Sprintf("Applying resource %s/%s in cluster: %s, namespace: %s", obj.GetKind(), obj.GetName(), k.config.Host, obj.GetNamespace()))
 	return k.runResourceCommand(ctx, obj, dryRunStrategy, func(f cmdutil.Factory, ioStreams genericclioptions.IOStreams, fileName string) error {
