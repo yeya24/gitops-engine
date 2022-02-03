@@ -74,7 +74,7 @@ func (e *gitOpsEngine) Sync(ctx context.Context,
 	namespace string,
 	opts ...sync.SyncOpt,
 ) ([]common.ResourceSyncResult, error) {
-	managedResources, err := e.cache.GetManagedLiveObjs(resources, isManaged)
+	managedResources, err := e.cache.GetManagedLiveObjs(ctx, resources, isManaged)
 	if err != nil {
 		return nil, err
 	}
