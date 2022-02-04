@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/argoproj/gitops-engine/pkg/utils/tracing"
 	"github.com/opentracing/opentracing-go"
+	"k8s.io/apimachinery/pkg/types"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -19,7 +20,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -132,6 +132,8 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 		listSemaphore:      semaphore.NewWeighted(defaultListSemaphoreWeight),
 		resources:          make(map[kube.ResourceKey]*Resource),
 		nsIndex:            make(map[string]map[kube.ResourceKey]*Resource),
+		childrenByParent:   make(map[kube.ResourceKey][]kube.ResourceKey),
+		uidResources:       make(map[types.UID]kube.ResourceKey),
 		config:             config,
 		kubectl: &kube.KubectlCmd{
 			Log: log,
@@ -170,9 +172,11 @@ type clusterCache struct {
 	listSemaphore      WeightedSemaphore
 
 	// lock is a rw lock which protects the fields of clusterInfo
-	lock      sync.RWMutex
-	resources map[kube.ResourceKey]*Resource
-	nsIndex   map[string]map[kube.ResourceKey]*Resource
+	lock             sync.RWMutex
+	resources        map[kube.ResourceKey]*Resource
+	nsIndex          map[string]map[kube.ResourceKey]*Resource
+	childrenByParent map[kube.ResourceKey][]kube.ResourceKey
+	uidResources     map[types.UID]kube.ResourceKey
 
 	kubectl          kube.Kubectl
 	log              logr.Logger
@@ -351,7 +355,20 @@ func (c *clusterCache) setNode(n *Resource) {
 		ns = make(map[kube.ResourceKey]*Resource)
 		c.nsIndex[key.Namespace] = ns
 	}
-	ns[key] = n
+
+	for _, node := range ns {
+		if n.isParentOf(node) {
+			if _, ok := c.childrenByParent[key]; !ok {
+				c.childrenByParent[key] = make([]kube.ResourceKey, 0)
+			}
+			c.childrenByParent[key] = append(c.childrenByParent[key], node.ResourceKey())
+		}
+	}
+	if _, ok := c.childrenByParent[key]; ok {
+		sort.Slice(c.childrenByParent[key], func(i, j int) bool {
+			return strings.Compare(c.childrenByParent[key][i].String(), c.childrenByParent[key][j].String()) < 0
+		})
+	}
 
 	// update inferred parent references
 	if n.isInferredParentOf != nil || mightHaveInferredOwner(n) {
@@ -365,6 +382,23 @@ func (c *clusterCache) setNode(n *Resource) {
 			}
 		}
 	}
+	ns[key] = n
+
+	for _, ownerRef := range n.OwnerRefs {
+		if x, ok := c.uidResources[ownerRef.UID]; ok {
+			if _, ok := c.childrenByParent[x]; ok {
+				res := c.childrenByParent[x]
+				res = append(res, key)
+				sort.Slice(res, func(i, j int) bool {
+					return strings.Compare(res[i].String(), res[j].String()) < 0
+				})
+				c.childrenByParent[x] = res
+			} else {
+				c.childrenByParent[x] = []kube.ResourceKey{key}
+			}
+		}
+	}
+	c.uidResources[n.Ref.UID] = key
 }
 
 // Invalidate cache and executes callback that optionally might update cache settings
@@ -785,38 +819,60 @@ func (c *clusterCache) IterateHierarchy(ctx context.Context, key kube.ResourceKe
 	defer c.lock.RUnlock()
 	if res, ok := c.resources[key]; ok {
 		nsNodes := c.nsIndex[key.Namespace]
-		action(res, nsNodes)
 		span.SetTag("nsNodes", len(nsNodes))
-		childrenByUID := make(map[types.UID][]*Resource)
-		for _, child := range nsNodes {
-			if res.isParentOf(child) {
-				childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
+		action(res, c.resources)
+		if children, ok := c.childrenByParent[key]; ok && len(children) > 0 {
+			span, ctx = tracing.StartSpan(ctx, "iterate children", opentracing.Tags{"children": len(children), "key": key.String()})
+			for _, child := range children {
+				if childRes, ok := c.resources[child]; ok {
+					action(childRes, nsNodes)
+					childRes.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) {
+						if err != nil {
+							c.log.V(2).Info(err.Error())
+							return
+						}
+						action(child, namespaceResources)
+					})
+				}
 			}
+			span.Finish()
 		}
-		span, ctx = tracing.StartSpan(ctx, "iterate children", opentracing.Tags{"children": len(childrenByUID), "key": key.String()})
-		// make sure children has no duplicates
-		for _, children := range childrenByUID {
-			if len(children) > 0 {
-				// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group). It is ok to pick any object but we need to make sure
-				// we pick the same child after every refresh.
-				sort.Slice(children, func(i, j int) bool {
-					key1 := children[i].ResourceKey()
-					key2 := children[j].ResourceKey()
-					return strings.Compare(key1.String(), key2.String()) < 0
-				})
-				child := children[0]
-				action(child, nsNodes)
-				child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) {
-					if err != nil {
-						c.log.V(2).Info(err.Error())
-						return
-					}
-					action(child, namespaceResources)
-				})
-			}
-		}
-		span.Finish()
 	}
+
+	//if res, ok := c.resources[key]; ok {
+	//	nsNodes := c.nsIndex[key.Namespace]
+	//	action(res, nsNodes)
+	//	span.SetTag("nsNodes", len(nsNodes))
+	//	childrenByUID := make(map[types.UID][]*Resource)
+	//	for _, child := range nsNodes {
+	//		if res.isParentOf(child) {
+	//			childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
+	//		}
+	//	}
+	//	span, ctx = tracing.StartSpan(ctx, "iterate children", opentracing.Tags{"children": len(childrenByUID), "key": key.String()})
+	//	// make sure children has no duplicates
+	//	for _, children := range childrenByUID {
+	//		if len(children) > 0 {
+	//			// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group). It is ok to pick any object but we need to make sure
+	//			// we pick the same child after every refresh.
+	//			sort.Slice(children, func(i, j int) bool {
+	//				key1 := children[i].ResourceKey()
+	//				key2 := children[j].ResourceKey()
+	//				return strings.Compare(key1.String(), key2.String()) < 0
+	//			})
+	//			child := children[0]
+	//			action(child, nsNodes)
+	//			child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) {
+	//				if err != nil {
+	//					c.log.V(2).Info(err.Error())
+	//					return
+	//				}
+	//				action(child, namespaceResources)
+	//			})
+	//		}
+	//	}
+	//	span.Finish()
+	//}
 }
 
 // IsNamespaced answers if specified group/kind is a namespaced resource API or not
@@ -964,6 +1020,18 @@ func (c *clusterCache) onNodeRemoved(key kube.ResourceKey) {
 			if len(ns) == 0 {
 				delete(c.nsIndex, key.Namespace)
 			}
+			delete(c.childrenByParent, key)
+			for _, ownerRef := range existing.OwnerRefs {
+				if res, ok := c.uidResources[ownerRef.UID]; ok && res.Kind == ownerRef.Kind && res.Name == ownerRef.Name {
+					for i, child := range c.childrenByParent[res] {
+						if child == key {
+							c.childrenByParent[res] = append(c.childrenByParent[res][:i], c.childrenByParent[res][i+1:]...)
+						}
+					}
+				}
+			}
+			delete(c.uidResources, existing.Ref.UID)
+
 			// remove ownership references from children with inferred references
 			if existing.isInferredParentOf != nil {
 				for k, v := range ns {

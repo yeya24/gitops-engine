@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -115,7 +116,7 @@ func ExampleNewClusterCache_inspectNamespaceResources() {
 	}
 	// Iterate default namespace resources tree
 	for _, root := range clusterCache.FindResources("default", TopLevelResource) {
-		clusterCache.IterateHierarchy(root.ResourceKey(), func(resource *Resource, _ map[kube.ResourceKey]*Resource) {
+		clusterCache.IterateHierarchy(context.Background(), root.ResourceKey(), func(resource *Resource, _ map[kube.ResourceKey]*Resource) {
 			fmt.Printf("resource: %s, info: %v\n", resource.Ref.String(), resource.Info)
 		})
 	}

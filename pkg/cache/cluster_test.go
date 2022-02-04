@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -109,7 +110,7 @@ func newCluster(t *testing.T, objs ...runtime.Object) *clusterCache {
 
 func getChildren(cluster *clusterCache, un *unstructured.Unstructured) []*Resource {
 	hierarchy := make([]*Resource, 0)
-	cluster.IterateHierarchy(kube.GetResourceKey(un), func(child *Resource, _ map[kube.ResourceKey]*Resource) {
+	cluster.IterateHierarchy(context.Background(), kube.GetResourceKey(un), func(child *Resource, _ map[kube.ResourceKey]*Resource) {
 		hierarchy = append(hierarchy, child)
 	})
 	return hierarchy[1:]
@@ -322,7 +323,7 @@ metadata:
   labels:
     app: helm-guestbook`)
 
-	managedObjs, err := cluster.GetManagedLiveObjs([]*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
+	managedObjs, err := cluster.GetManagedLiveObjs(context.Background(), []*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
 		return len(r.OwnerRefs) == 0
 	})
 	require.NoError(t, err)
@@ -349,7 +350,7 @@ metadata:
   labels:
     app: helm-guestbook`)
 
-	managedObjs, err := cluster.GetManagedLiveObjs([]*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
+	managedObjs, err := cluster.GetManagedLiveObjs(context.Background(), []*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
 		return len(r.OwnerRefs) == 0
 	})
 	assert.Nil(t, managedObjs)
@@ -376,7 +377,7 @@ metadata:
     app: helm-guestbook`)
 
 	cluster.clusterResources = true
-	_, err = cluster.GetManagedLiveObjs([]*unstructured.Unstructured{clusterLevelRes}, func(r *Resource) bool {
+	_, err = cluster.GetManagedLiveObjs(context.Background(), []*unstructured.Unstructured{clusterLevelRes}, func(r *Resource) bool {
 		return len(r.OwnerRefs) == 0
 	})
 	assert.Nil(t, err)
@@ -391,7 +392,7 @@ metadata:
     app: helm-guestbook`)
 
 	cluster.clusterResources = true
-	_, err = cluster.GetManagedLiveObjs([]*unstructured.Unstructured{otherNamespaceRes}, func(r *Resource) bool {
+	_, err = cluster.GetManagedLiveObjs(context.Background(), []*unstructured.Unstructured{otherNamespaceRes}, func(r *Resource) bool {
 		return len(r.OwnerRefs) == 0
 	})
 	assert.EqualError(t, err, "Namespace \"some-other-namespace\" for Deployment \"helm-guestbook\" is not managed")
@@ -416,7 +417,7 @@ metadata:
   labels:
     app: helm-guestbook`)
 
-	managedObjs, err := cluster.GetManagedLiveObjs([]*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
+	managedObjs, err := cluster.GetManagedLiveObjs(context.Background(), []*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
 		return len(r.OwnerRefs) == 0
 	})
 	require.NoError(t, err)
@@ -444,7 +445,7 @@ metadata:
   labels:
     app: helm-guestbook`)
 
-	managedObjs, err := cluster.GetManagedLiveObjs([]*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
+	managedObjs, err := cluster.GetManagedLiveObjs(context.Background(), []*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
 		return len(r.OwnerRefs) == 0
 	})
 	require.NoError(t, err)
@@ -472,7 +473,7 @@ metadata:
   labels:
     app: helm-guestbook`)
 
-	managedObjs, err := cluster.GetManagedLiveObjs([]*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
+	managedObjs, err := cluster.GetManagedLiveObjs(context.Background(), []*unstructured.Unstructured{targetDeploy}, func(r *Resource) bool {
 		return len(r.OwnerRefs) == 0
 	})
 	assert.Nil(t, managedObjs)
