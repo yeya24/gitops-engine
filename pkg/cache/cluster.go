@@ -786,6 +786,7 @@ func (c *clusterCache) IterateHierarchy(ctx context.Context, key kube.ResourceKe
 	if res, ok := c.resources[key]; ok {
 		nsNodes := c.nsIndex[key.Namespace]
 		action(res, nsNodes)
+		span.SetTag("nsNodes", len(nsNodes))
 		childrenByUID := make(map[types.UID][]*Resource)
 		for _, child := range nsNodes {
 			if res.isParentOf(child) {
