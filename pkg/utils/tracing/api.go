@@ -10,7 +10,7 @@ type Tags = opentracing.Tags
 
 type contextKey struct{}
 
-var tracerKey = contextKey{}
+var TracerKey = contextKey{}
 
 /*
 	Poor Mans OpenTracing.
@@ -46,12 +46,12 @@ func StartSpan(ctx context.Context, operationName string, opts ...opentracing.St
 
 // ContextWithTracer returns a new `context.Context` that holds a reference to given opentracing.Tracer.
 func ContextWithTracer(ctx context.Context, tracer opentracing.Tracer) context.Context {
-	return context.WithValue(ctx, tracerKey, tracer)
+	return context.WithValue(ctx, TracerKey, tracer)
 }
 
 // tracerFromContext extracts opentracing.Tracer from the given context.
 func tracerFromContext(ctx context.Context) opentracing.Tracer {
-	val := ctx.Value(tracerKey)
+	val := ctx.Value(TracerKey)
 	if sp, ok := val.(opentracing.Tracer); ok {
 		return sp
 	}
