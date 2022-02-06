@@ -678,9 +678,9 @@ func (c *clusterCache) sync() error {
 	err = kube.RunAllAsync(len(apis), func(i int) error {
 		api := apis[i]
 
-		lock.Lock()
 		ctx, cancel := context.WithCancel(context.Background())
 		info := &apiMeta{namespaced: api.Meta.Namespaced, watchCancel: cancel}
+		lock.Lock()
 		c.apisMeta[api.GroupKind] = info
 		c.namespacedResources[api.GroupKind] = api.Meta.Namespaced
 		lock.Unlock()
@@ -691,8 +691,9 @@ func (c *clusterCache) sync() error {
 					if un, ok := obj.(*unstructured.Unstructured); !ok {
 						return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
 					} else {
+						node := c.newResource(un)
 						lock.Lock()
-						c.setNode(c.newResource(un))
+						c.setNode(node)
 						lock.Unlock()
 					}
 					return nil
