@@ -781,18 +781,25 @@ func (c *clusterCache) IterateHierarchy(ctx context.Context, key kube.ResourceKe
 	span, ctx := tracing.StartSpan(ctx, "clusterCache.IterateHierarchy", opentracing.Tags{"key": key.String()})
 	defer span.Finish()
 
+	acquireLockSpan, _ := tracing.StartSpan(ctx, "acquire_cluster_lock", opentracing.Tags{"key": key.String()})
 	c.lock.RLock()
 	defer c.lock.RUnlock()
+	acquireLockSpan.Finish()
+
 	if res, ok := c.resources[key]; ok {
 		nsNodes := c.nsIndex[key.Namespace]
 		action(res, nsNodes)
 		span.SetTag("nsNodes", len(nsNodes))
 		childrenByUID := make(map[types.UID][]*Resource)
+
+		iterateChildSpan, _ := tracing.StartSpan(ctx, "get_children_refs", opentracing.Tags{"key": key.String()})
 		for _, child := range nsNodes {
 			if res.isParentOf(child) {
 				childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
 			}
 		}
+		iterateChildSpan.Finish()
+
 		span, ctx = tracing.StartSpan(ctx, "iterate children", opentracing.Tags{"children": len(childrenByUID), "key": key.String()})
 		// make sure children has no duplicates
 		for _, children := range childrenByUID {
