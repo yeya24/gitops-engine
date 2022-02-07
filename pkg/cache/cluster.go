@@ -789,10 +789,15 @@ func (c *clusterCache) IterateGroupHierarchy(ctx context.Context, keys []kube.Re
 	defer c.lock.RUnlock()
 	acquireLockSpan.Finish()
 
+	wg := sync.WaitGroup{}
+	var lock sync.Mutex
 	for _, key := range keys {
 		if res, ok := c.resources[key]; ok {
+			wg.Add(1)
 			nsNodes := c.nsIndex[key.Namespace]
+			lock.Lock()
 			action(res, nsNodes)
+			lock.Unlock()
 			childrenByUID := make(map[types.UID][]*Resource)
 
 			for _, child := range nsNodes {
@@ -811,18 +816,24 @@ func (c *clusterCache) IterateGroupHierarchy(ctx context.Context, keys []kube.Re
 						return strings.Compare(key1.String(), key2.String()) < 0
 					})
 					child := children[0]
+					lock.Lock()
 					action(child, nsNodes)
+					lock.Unlock()
 					child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) {
 						if err != nil {
 							c.log.V(2).Info(err.Error())
 							return
 						}
+						lock.Lock()
 						action(child, namespaceResources)
+						lock.Unlock()
 					})
 				}
 			}
+			wg.Done()
 		}
 	}
+	wg.Wait()
 }
 
 // IterateHierarchy iterates resource tree starting from the specified top level resource and executes callback for each resource in the tree
