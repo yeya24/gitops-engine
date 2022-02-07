@@ -666,7 +666,9 @@ func (c *clusterCache) sync() error {
 	if err != nil {
 		return err
 	}
+	c.apiResourcesMtx.Lock()
 	c.apiResources = apiResources
+	c.apiResourcesMtx.Unlock()
 
 	openAPISchema, err := c.kubectl.LoadOpenAPISchema(config)
 	if err != nil {
@@ -1067,6 +1069,8 @@ func (c *clusterCache) GetClusterInfo() ClusterInfo {
 	defer c.lock.RUnlock()
 	c.syncStatus.lock.Lock()
 	defer c.syncStatus.lock.Unlock()
+	c.apiResourcesMtx.RLock()
+	defer c.apiResourcesMtx.RUnlock()
 
 	return ClusterInfo{
 		APIsCount:         len(c.apisMeta),
