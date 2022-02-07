@@ -146,6 +146,7 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 			syncTime:      nil,
 		},
 		watchResyncTimeout:      defaultWatchResyncTimeout,
+		clusterRetryTimeout:     ClusterRetryTimeout,
 		resourceUpdatedHandlers: map[uint64]OnResourceUpdatedHandler{},
 		eventHandlers:           map[uint64]OnEventHandler{},
 		log:                     log,
@@ -166,7 +167,8 @@ type clusterCache struct {
 	namespacedResources map[schema.GroupKind]bool
 
 	// maximum time we allow watches to run before relisting the group/kind and restarting the watch
-	watchResyncTimeout time.Duration
+	watchResyncTimeout  time.Duration
+	clusterRetryTimeout time.Duration
 
 	// size of a page for list operations pager.
 	listPageSize int64
@@ -393,14 +395,14 @@ func (c *clusterCache) Invalidate(opts ...UpdateSettingsFunc) {
 }
 
 // clusterCacheSync's lock should be held before calling this method
-func (syncStatus *clusterCacheSync) synced() bool {
+func (syncStatus *clusterCacheSync) synced(clusterRetryTimeout time.Duration) bool {
 	syncTime := syncStatus.syncTime
 
 	if syncTime == nil {
 		return false
 	}
 	if syncStatus.syncError != nil {
-		return time.Now().Before(syncTime.Add(ClusterRetryTimeout))
+		return time.Now().Before(syncTime.Add(clusterRetryTimeout))
 	}
 	if syncStatus.resyncTimeout == 0 {
 		// cluster resync timeout has been disabled
@@ -728,7 +730,7 @@ func (c *clusterCache) EnsureSynced() error {
 
 	// first check if cluster is synced *without acquiring the full clusterCache lock*
 	syncStatus.lock.Lock()
-	if syncStatus.synced() {
+	if syncStatus.synced(c.clusterRetryTimeout) {
 		syncError := syncStatus.syncError
 		syncStatus.lock.Unlock()
 		return syncError
@@ -742,7 +744,7 @@ func (c *clusterCache) EnsureSynced() error {
 
 	// before doing any work, check once again now that we have the lock, to see if it got
 	// synced between the first check and now
-	if syncStatus.synced() {
+	if syncStatus.synced(c.clusterRetryTimeout) {
 		return syncStatus.syncError
 	}
 	err := c.sync()
@@ -758,10 +760,10 @@ func (c *clusterCache) EnsureSyncedAndReturnAPIResources() ([]kube.APIResourceIn
 
 	// first check if cluster is synced *without acquiring the full clusterCache lock*
 	syncStatus.lock.Lock()
-	if syncStatus.synced() {
+	if syncStatus.synced(c.clusterRetryTimeout) {
 		syncError := syncStatus.syncError
 		syncStatus.lock.Unlock()
-		return nil, syncError
+		return c.GetAPIResources(), syncError
 	}
 	syncStatus.lock.Unlock() // release the lock, so that we can acquire the parent lock (see struct comment re: lock acquisition ordering)
 
@@ -772,7 +774,7 @@ func (c *clusterCache) EnsureSyncedAndReturnAPIResources() ([]kube.APIResourceIn
 
 	// before doing any work, check once again now that we have the lock, to see if it got
 	// synced between the first check and now
-	if syncStatus.synced() {
+	if syncStatus.synced(c.clusterRetryTimeout) {
 		return nil, syncStatus.syncError
 	}
 	err := c.sync()
@@ -826,44 +828,46 @@ func (c *clusterCache) IterateGroupHierarchy(ctx context.Context, keys []kube.Re
 	var lock sync.Mutex
 	for _, key := range keys {
 		if res, ok := c.resources[key]; ok {
-			wg.Add(1)
-			nsNodes := c.nsIndex[key.Namespace]
-			lock.Lock()
-			action(res, nsNodes)
-			lock.Unlock()
-			childrenByUID := make(map[types.UID][]*Resource)
+			go func() {
+				wg.Add(1)
+				defer wg.Done()
+				nsNodes := c.nsIndex[key.Namespace]
+				lock.Lock()
+				action(res, nsNodes)
+				lock.Unlock()
+				childrenByUID := make(map[types.UID][]*Resource)
 
-			for _, child := range nsNodes {
-				if res.isParentOf(child) {
-					childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
+				for _, child := range nsNodes {
+					if res.isParentOf(child) {
+						childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
+					}
 				}
-			}
-			// make sure children has no duplicates
-			for _, children := range childrenByUID {
-				if len(children) > 0 {
-					// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group). It is ok to pick any object but we need to make sure
-					// we pick the same child after every refresh.
-					sort.Slice(children, func(i, j int) bool {
-						key1 := children[i].ResourceKey()
-						key2 := children[j].ResourceKey()
-						return strings.Compare(key1.String(), key2.String()) < 0
-					})
-					child := children[0]
-					lock.Lock()
-					action(child, nsNodes)
-					lock.Unlock()
-					child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) {
-						if err != nil {
-							c.log.V(2).Info(err.Error())
-							return
-						}
+				// make sure children has no duplicates
+				for _, children := range childrenByUID {
+					if len(children) > 0 {
+						// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group). It is ok to pick any object but we need to make sure
+						// we pick the same child after every refresh.
+						sort.Slice(children, func(i, j int) bool {
+							key1 := children[i].ResourceKey()
+							key2 := children[j].ResourceKey()
+							return strings.Compare(key1.String(), key2.String()) < 0
+						})
+						child := children[0]
 						lock.Lock()
-						action(child, namespaceResources)
+						action(child, nsNodes)
 						lock.Unlock()
-					})
+						child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) {
+							if err != nil {
+								c.log.V(2).Info(err.Error())
+								return
+							}
+							lock.Lock()
+							action(child, namespaceResources)
+							lock.Unlock()
+						})
+					}
 				}
-			}
-			wg.Done()
+			}()
 		}
 	}
 	wg.Wait()
@@ -878,9 +882,10 @@ func (c *clusterCache) EnsureSyncedAndIterateGroupHierarchy(ctx context.Context,
 
 	// first check if cluster is synced *without acquiring the full clusterCache lock*
 	syncStatus.lock.Lock()
-	if syncStatus.synced() {
+	if syncStatus.synced(c.clusterRetryTimeout) {
 		syncError := syncStatus.syncError
 		syncStatus.lock.Unlock()
+		c.IterateGroupHierarchy(ctx, keys, action)
 		return syncError
 	}
 	syncStatus.lock.Unlock() // release the lock, so that we can acquire the parent lock (see struct comment re: lock acquisition ordering)
@@ -895,7 +900,7 @@ func (c *clusterCache) EnsureSyncedAndIterateGroupHierarchy(ctx context.Context,
 
 	// before doing any work, check once again now that we have the lock, to see if it got
 	// synced between the first check and now
-	if syncStatus.synced() {
+	if syncStatus.synced(c.clusterRetryTimeout) {
 		return syncStatus.syncError
 	}
 	err := c.sync()
@@ -910,44 +915,46 @@ func (c *clusterCache) EnsureSyncedAndIterateGroupHierarchy(ctx context.Context,
 	var lock sync.Mutex
 	for _, key := range keys {
 		if res, ok := c.resources[key]; ok {
-			wg.Add(1)
-			nsNodes := c.nsIndex[key.Namespace]
-			lock.Lock()
-			action(res, nsNodes)
-			lock.Unlock()
-			childrenByUID := make(map[types.UID][]*Resource)
+			go func() {
+				wg.Add(1)
+				defer wg.Done()
+				nsNodes := c.nsIndex[key.Namespace]
+				lock.Lock()
+				action(res, nsNodes)
+				lock.Unlock()
+				childrenByUID := make(map[types.UID][]*Resource)
 
-			for _, child := range nsNodes {
-				if res.isParentOf(child) {
-					childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
+				for _, child := range nsNodes {
+					if res.isParentOf(child) {
+						childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
+					}
 				}
-			}
-			// make sure children has no duplicates
-			for _, children := range childrenByUID {
-				if len(children) > 0 {
-					// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group). It is ok to pick any object but we need to make sure
-					// we pick the same child after every refresh.
-					sort.Slice(children, func(i, j int) bool {
-						key1 := children[i].ResourceKey()
-						key2 := children[j].ResourceKey()
-						return strings.Compare(key1.String(), key2.String()) < 0
-					})
-					child := children[0]
-					lock.Lock()
-					action(child, nsNodes)
-					lock.Unlock()
-					child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) {
-						if err != nil {
-							c.log.V(2).Info(err.Error())
-							return
-						}
+				// make sure children has no duplicates
+				for _, children := range childrenByUID {
+					if len(children) > 0 {
+						// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group). It is ok to pick any object but we need to make sure
+						// we pick the same child after every refresh.
+						sort.Slice(children, func(i, j int) bool {
+							key1 := children[i].ResourceKey()
+							key2 := children[j].ResourceKey()
+							return strings.Compare(key1.String(), key2.String()) < 0
+						})
+						child := children[0]
 						lock.Lock()
-						action(child, namespaceResources)
+						action(child, nsNodes)
 						lock.Unlock()
-					})
+						child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) {
+							if err != nil {
+								c.log.V(2).Info(err.Error())
+								return
+							}
+							lock.Lock()
+							action(child, namespaceResources)
+							lock.Unlock()
+						})
+					}
 				}
-			}
-			wg.Done()
+			}()
 		}
 	}
 	wg.Wait()
