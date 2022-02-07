@@ -89,8 +89,6 @@ type Unsubscribe func()
 type ClusterCache interface {
 	// EnsureSynced checks cache state and synchronizes it if necessary
 	EnsureSynced() error
-	// EnsureSyncedAndReturnAPIResources checks cache state and synchronizes it if necessary and returns the API resources.
-	EnsureSyncedAndReturnAPIResources() ([]kube.APIResourceInfo, error)
 	// GetServerVersion returns observed cluster version
 	GetServerVersion() string
 	// GetAPIResources returns information about observed API resources
@@ -105,7 +103,6 @@ type ClusterCache interface {
 	IterateHierarchy(ctx context.Context, key kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource))
 	// IterateGroupHierarchy iterates resource tree starting from the specified top level resource and executes callback for each resource in the tree
 	IterateGroupHierarchy(ctx context.Context, key []kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource))
-	EnsureSyncedAndIterateGroupHierarchy(ctx context.Context, keys []kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource)) error
 	// IsNamespaced answers if specified group/kind is a namespaced resource API or not
 	IsNamespaced(gk schema.GroupKind) (bool, error)
 	// GetManagedLiveObjs helps finding matching live K8S resources for a given resources list.
@@ -160,9 +157,10 @@ func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCa
 type clusterCache struct {
 	syncStatus clusterCacheSync
 
-	apisMeta      map[schema.GroupKind]*apiMeta
-	serverVersion string
-	apiResources  []kube.APIResourceInfo
+	apisMeta        map[schema.GroupKind]*apiMeta
+	serverVersion   string
+	apiResourcesMtx sync.RWMutex
+	apiResources    []kube.APIResourceInfo
 	// namespacedResources is a simple map which indicates a groupKind is namespaced
 	namespacedResources map[schema.GroupKind]bool
 
@@ -262,8 +260,8 @@ func (c *clusterCache) GetServerVersion() string {
 
 // GetAPIResources returns information about observed API resources
 func (c *clusterCache) GetAPIResources() []kube.APIResourceInfo {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
+	c.apiResourcesMtx.RLock()
+	defer c.apiResourcesMtx.RUnlock()
 
 	return c.apiResources
 }
@@ -591,15 +589,19 @@ func (c *clusterCache) watchEvents(ctx context.Context, api kube.APIResourceInfo
 					}
 
 					if event.Type == watch.Deleted {
+						c.apiResourcesMtx.Lock()
 						for i := range resources {
 							c.deleteAPIResource(resources[i])
 						}
+						c.apiResourcesMtx.Unlock()
 					} else {
 						// add new CRD's groupkind to c.apigroups
 						if event.Type == watch.Added {
+							c.apiResourcesMtx.Lock()
 							for i := range resources {
 								c.appendAPIResource(resources[i])
 							}
+							c.apiResourcesMtx.Unlock()
 						}
 						err = runSynced(&c.lock, func() error {
 							return c.startMissingWatches()
@@ -754,36 +756,6 @@ func (c *clusterCache) EnsureSynced() error {
 	return syncStatus.syncError
 }
 
-// EnsureSyncedAndReturnAPIResources checks cache state and synchronizes it if necessary
-func (c *clusterCache) EnsureSyncedAndReturnAPIResources() ([]kube.APIResourceInfo, error) {
-	syncStatus := &c.syncStatus
-
-	// first check if cluster is synced *without acquiring the full clusterCache lock*
-	syncStatus.lock.Lock()
-	if syncStatus.synced(c.clusterRetryTimeout) {
-		syncError := syncStatus.syncError
-		syncStatus.lock.Unlock()
-		return c.GetAPIResources(), syncError
-	}
-	syncStatus.lock.Unlock() // release the lock, so that we can acquire the parent lock (see struct comment re: lock acquisition ordering)
-
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	syncStatus.lock.Lock()
-	defer syncStatus.lock.Unlock()
-
-	// before doing any work, check once again now that we have the lock, to see if it got
-	// synced between the first check and now
-	if syncStatus.synced(c.clusterRetryTimeout) {
-		return nil, syncStatus.syncError
-	}
-	err := c.sync()
-	syncTime := time.Now()
-	syncStatus.syncTime = &syncTime
-	syncStatus.syncError = err
-	return c.apiResources, syncStatus.syncError
-}
-
 func (c *clusterCache) FindResources(namespace string, predicates ...func(r *Resource) bool) map[kube.ResourceKey]*Resource {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
@@ -871,94 +843,6 @@ func (c *clusterCache) IterateGroupHierarchy(ctx context.Context, keys []kube.Re
 		}
 	}
 	wg.Wait()
-}
-
-// EnsureSyncedAndIterateGroupHierarchy checks cache state and synchronizes it if necessary
-func (c *clusterCache) EnsureSyncedAndIterateGroupHierarchy(ctx context.Context, keys []kube.ResourceKey, action func(resource *Resource, namespaceResources map[kube.ResourceKey]*Resource)) error {
-	span, ctx := tracing.StartSpan(ctx, "clusterCache.EnsureSyncedAndIterateGroupHierarchy", opentracing.Tags{"keys": len(keys)})
-	defer span.Finish()
-
-	syncStatus := &c.syncStatus
-
-	// first check if cluster is synced *without acquiring the full clusterCache lock*
-	syncStatus.lock.Lock()
-	if syncStatus.synced(c.clusterRetryTimeout) {
-		syncError := syncStatus.syncError
-		syncStatus.lock.Unlock()
-		c.IterateGroupHierarchy(ctx, keys, action)
-		return syncError
-	}
-	syncStatus.lock.Unlock() // release the lock, so that we can acquire the parent lock (see struct comment re: lock acquisition ordering)
-
-	acquireLockSpan, _ := tracing.StartSpan(ctx, "acquire_cluster_lock")
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	acquireLockSpan.Finish()
-
-	syncStatus.lock.Lock()
-	defer syncStatus.lock.Unlock()
-
-	// before doing any work, check once again now that we have the lock, to see if it got
-	// synced between the first check and now
-	if syncStatus.synced(c.clusterRetryTimeout) {
-		return syncStatus.syncError
-	}
-	err := c.sync()
-	syncTime := time.Now()
-	syncStatus.syncTime = &syncTime
-	syncStatus.syncError = err
-	if err != nil {
-		return err
-	}
-
-	var wg sync.WaitGroup
-	var lock sync.Mutex
-	for _, key := range keys {
-		if res, ok := c.resources[key]; ok {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				nsNodes := c.nsIndex[key.Namespace]
-				lock.Lock()
-				action(res, nsNodes)
-				lock.Unlock()
-				childrenByUID := make(map[types.UID][]*Resource)
-
-				for _, child := range nsNodes {
-					if res.isParentOf(child) {
-						childrenByUID[child.Ref.UID] = append(childrenByUID[child.Ref.UID], child)
-					}
-				}
-				// make sure children has no duplicates
-				for _, children := range childrenByUID {
-					if len(children) > 0 {
-						// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group). It is ok to pick any object but we need to make sure
-						// we pick the same child after every refresh.
-						sort.Slice(children, func(i, j int) bool {
-							key1 := children[i].ResourceKey()
-							key2 := children[j].ResourceKey()
-							return strings.Compare(key1.String(), key2.String()) < 0
-						})
-						child := children[0]
-						lock.Lock()
-						action(child, nsNodes)
-						lock.Unlock()
-						child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{res.ResourceKey(): true}, func(err error, child *Resource, namespaceResources map[kube.ResourceKey]*Resource) {
-							if err != nil {
-								c.log.V(2).Info(err.Error())
-								return
-							}
-							lock.Lock()
-							action(child, namespaceResources)
-							lock.Unlock()
-						})
-					}
-				}
-			}()
-		}
-	}
-	wg.Wait()
-	return nil
 }
 
 // IterateHierarchy iterates resource tree starting from the specified top level resource and executes callback for each resource in the tree
