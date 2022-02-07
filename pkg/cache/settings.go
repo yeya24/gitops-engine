@@ -112,6 +112,13 @@ func SetResyncTimeout(timeout time.Duration) UpdateSettingsFunc {
 	}
 }
 
+// SetClusterRetryTimeout updates cluster re-sync timeout for sync status error app
+func SetClusterRetryTimeout(time time.Duration) UpdateSettingsFunc {
+	return func(cache *clusterCache) {
+		cache.clusterRetryTimeout = time
+	}
+}
+
 // SetWatchResyncTimeout updates cluster re-sync timeout
 func SetWatchResyncTimeout(timeout time.Duration) UpdateSettingsFunc {
 	return func(cache *clusterCache) {
