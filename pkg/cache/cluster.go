@@ -824,12 +824,12 @@ func (c *clusterCache) IterateGroupHierarchy(ctx context.Context, keys []kube.Re
 	defer c.lock.RUnlock()
 	acquireLockSpan.Finish()
 
-	wg := sync.WaitGroup{}
+	var wg sync.WaitGroup
 	var lock sync.Mutex
 	for _, key := range keys {
 		if res, ok := c.resources[key]; ok {
+			wg.Add(1)
 			go func() {
-				wg.Add(1)
 				defer wg.Done()
 				nsNodes := c.nsIndex[key.Namespace]
 				lock.Lock()
@@ -911,12 +911,12 @@ func (c *clusterCache) EnsureSyncedAndIterateGroupHierarchy(ctx context.Context,
 		return err
 	}
 
-	wg := sync.WaitGroup{}
+	var wg sync.WaitGroup
 	var lock sync.Mutex
 	for _, key := range keys {
 		if res, ok := c.resources[key]; ok {
+			wg.Add(1)
 			go func() {
-				wg.Add(1)
 				defer wg.Done()
 				nsNodes := c.nsIndex[key.Namespace]
 				lock.Lock()
