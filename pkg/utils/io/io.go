@@ -4,9 +4,8 @@ import (
 	"os"
 )
 
-var (
-	TempDir string
-)
+// TempDir is set to '/dev/shm' if exists, otherwise is "", which defaults to os.TempDir() when passed to os.CreateTemp()
+var TempDir string
 
 func init() {
 	fileInfo, err := os.Stat("/dev/shm")

@@ -29,9 +29,8 @@ type syncTask struct {
 func ternary(val bool, a, b string) string {
 	if val {
 		return a
-	} else {
-		return b
 	}
+	return b
 }
 
 func (t *syncTask) String() string {
@@ -71,6 +70,7 @@ func (t *syncTask) isHook() bool {
 func (t *syncTask) group() string {
 	return t.groupVersionKind().Group
 }
+
 func (t *syncTask) kind() string {
 	return t.groupVersionKind().Kind
 }
@@ -107,12 +107,15 @@ func (t *syncTask) successful() bool {
 	return t.operationState.Successful()
 }
 
+func (t *syncTask) pruned() bool {
+	return t.syncStatus == common.ResultCodePruned
+}
+
 func (t *syncTask) hookType() common.HookType {
 	if t.isHook() {
 		return common.HookType(t.phase)
-	} else {
-		return ""
 	}
+	return ""
 }
 
 func (t *syncTask) hasHookDeletePolicy(policy common.HookDeletePolicy) bool {

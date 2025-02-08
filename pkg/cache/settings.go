@@ -17,8 +17,7 @@ func NewNoopSettings() *noopSettings {
 	return &noopSettings{}
 }
 
-type noopSettings struct {
-}
+type noopSettings struct{}
 
 func (f *noopSettings) GetResourceHealth(_ *unstructured.Unstructured) (*health.HealthStatus, error) {
 	return nil, nil
@@ -156,5 +155,31 @@ func SetRetryOptions(maxRetries int32, useBackoff bool, retryFunc ListRetryFunc)
 		cache.listRetryLimit = maxRetries
 		cache.listRetryUseBackoff = useBackoff
 		cache.listRetryFunc = retryFunc
+	}
+}
+
+// SetRespectRBAC allows to set whether to respect the controller rbac in list/watches
+func SetRespectRBAC(respectRBAC int) UpdateSettingsFunc {
+	return func(cache *clusterCache) {
+		// if invalid value is provided disable respect rbac
+		if respectRBAC < RespectRbacDisabled || respectRBAC > RespectRbacStrict {
+			cache.respectRBAC = RespectRbacDisabled
+		} else {
+			cache.respectRBAC = respectRBAC
+		}
+	}
+}
+
+// SetBatchEventsProcessing allows to set whether to process events in batch
+func SetBatchEventsProcessing(batchProcessing bool) UpdateSettingsFunc {
+	return func(cache *clusterCache) {
+		cache.batchEventsProcessing = batchProcessing
+	}
+}
+
+// SetEventProcessingInterval allows to set the interval for processing events
+func SetEventProcessingInterval(interval time.Duration) UpdateSettingsFunc {
+	return func(cache *clusterCache) {
+		cache.eventProcessingInterval = interval
 	}
 }

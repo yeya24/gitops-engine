@@ -1,25 +1,34 @@
 package diff
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	openapi_v2 "github.com/google/gnostic-models/openapiv2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/klog/v2/klogr"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/managedfields"
+	"k8s.io/klog/v2/textlogger"
+	openapiproto "k8s.io/kube-openapi/pkg/util/proto"
 	"sigs.k8s.io/yaml"
+
+	"github.com/argoproj/gitops-engine/pkg/diff/mocks"
+	"github.com/argoproj/gitops-engine/pkg/diff/testdata"
 )
 
 func printDiff(result *DiffResult) (string, error) {
@@ -37,7 +46,7 @@ func printDiff(result *DiffResult) (string, error) {
 
 // printDiffInternal prints a diff between two unstructured objects using an external diff utility and returns the output.
 func printDiffInternal(name string, live *unstructured.Unstructured, target *unstructured.Unstructured) ([]byte, error) {
-	tempDir, err := ioutil.TempDir("", "argocd-diff")
+	tempDir, err := os.MkdirTemp("", "argocd-diff")
 	if err != nil {
 		return nil, err
 	}
@@ -49,11 +58,11 @@ func printDiffInternal(name string, live *unstructured.Unstructured, target *uns
 			return nil, err
 		}
 	}
-	err = ioutil.WriteFile(targetFile, targetData, 0644)
+	err = os.WriteFile(targetFile, targetData, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	liveFile := filepath.Join(tempDir, fmt.Sprintf("%s-live.yaml", name))
+	liveFile := filepath.Join(tempDir, name+"-live.yaml")
 	liveData := []byte("")
 	if live != nil {
 		liveData, err = yaml.Marshal(live)
@@ -61,7 +70,7 @@ func printDiffInternal(name string, live *unstructured.Unstructured, target *uns
 			return nil, err
 		}
 	}
-	err = ioutil.WriteFile(liveFile, liveData, 0644)
+	err = os.WriteFile(liveFile, liveData, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +78,7 @@ func printDiffInternal(name string, live *unstructured.Unstructured, target *uns
 	return cmd.Output()
 }
 
-func toUnstructured(obj interface{}) (*unstructured.Unstructured, error) {
+func toUnstructured(obj any) (*unstructured.Unstructured, error) {
 	uObj, err := runtime.NewTestUnstructuredConverter(equality.Semantic).ToUnstructured(obj)
 	if err != nil {
 		return nil, err
@@ -77,7 +86,7 @@ func toUnstructured(obj interface{}) (*unstructured.Unstructured, error) {
 	return &unstructured.Unstructured{Object: uObj}, nil
 }
 
-func mustToUnstructured(obj interface{}) *unstructured.Unstructured {
+func mustToUnstructured(obj any) *unstructured.Unstructured {
 	un, err := toUnstructured(obj)
 	if err != nil {
 		panic(err)
@@ -86,7 +95,7 @@ func mustToUnstructured(obj interface{}) *unstructured.Unstructured {
 }
 
 func unmarshalFile(path string) *unstructured.Unstructured {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		panic(err)
 	}
@@ -116,18 +125,18 @@ func newDeployment() *appsv1.Deployment {
 					"app": "demo",
 				},
 			},
-			Template: v1.PodTemplateSpec{
+			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
 						"app": "demo",
 					},
 				},
-				Spec: v1.PodSpec{
-					Containers: []v1.Container{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
 						{
 							Name:  "demo",
 							Image: "gcr.io/kuar-demo/kuard-amd64:1",
-							Ports: []v1.ContainerPort{
+							Ports: []corev1.ContainerPort{
 								{
 									ContainerPort: 80,
 								},
@@ -141,6 +150,7 @@ func newDeployment() *appsv1.Deployment {
 }
 
 func diff(t *testing.T, config, live *unstructured.Unstructured, options ...Option) *DiffResult {
+	t.Helper()
 	res, err := Diff(config, live, options...)
 	assert.NoError(t, err)
 	return res
@@ -162,9 +172,7 @@ func TestDiff(t *testing.T) {
 func TestDiff_KnownTypeInvalidValue(t *testing.T) {
 	leftDep := newDeployment()
 	leftUn := mustToUnstructured(leftDep)
-	if !assert.NoError(t, unstructured.SetNestedField(leftUn.Object, "badValue", "spec", "revisionHistoryLimit")) {
-		return
-	}
+	require.NoError(t, unstructured.SetNestedField(leftUn.Object, "badValue", "spec", "revisionHistoryLimit"))
 
 	t.Run("NoDifference", func(t *testing.T) {
 		diffRes := diff(t, leftUn, leftUn, diffOptionsForTest()...)
@@ -178,9 +186,7 @@ func TestDiff_KnownTypeInvalidValue(t *testing.T) {
 
 	t.Run("HasDifference", func(t *testing.T) {
 		rightUn := leftUn.DeepCopy()
-		if !assert.NoError(t, unstructured.SetNestedField(rightUn.Object, "3", "spec", "revisionHistoryLimit")) {
-			return
-		}
+		require.NoError(t, unstructured.SetNestedField(rightUn.Object, "3", "spec", "revisionHistoryLimit"))
 
 		diffRes := diff(t, leftUn, rightUn, diffOptionsForTest()...)
 		assert.True(t, diffRes.Modified)
@@ -196,13 +202,13 @@ func TestDiffWithNils(t *testing.T) {
 	// This "difference" is checked at the comparator.
 	assert.False(t, diffRes.Modified)
 	diffRes, err := TwoWayDiff(nil, resource)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.False(t, diffRes.Modified)
 
 	diffRes = diff(t, resource, nil, diffOptionsForTest()...)
 	assert.True(t, diffRes.Modified)
 	diffRes, err = TwoWayDiff(resource, nil)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.True(t, diffRes.Modified)
 }
 
@@ -291,7 +297,7 @@ func TestThreeWayDiff(t *testing.T) {
 	// difference
 	configBytes, err := json.Marshal(configDep)
 	require.NoError(t, err)
-	liveDep.Annotations[v1.LastAppliedConfigAnnotation] = string(configBytes)
+	liveDep.Annotations[corev1.LastAppliedConfigAnnotation] = string(configBytes)
 	configUn = mustToUnstructured(configDep)
 	liveUn = mustToUnstructured(liveDep)
 	res = diff(t, configUn, liveUn, diffOptionsForTest()...)
@@ -313,7 +319,7 @@ func TestThreeWayDiff(t *testing.T) {
 	// last-applied-configuration annotation from the live object, and redo the diff. This time,
 	// the diff will report not modified (because we have no way of knowing what was a defaulted
 	// field without this annotation)
-	delete(liveDep.Annotations, v1.LastAppliedConfigAnnotation)
+	delete(liveDep.Annotations, corev1.LastAppliedConfigAnnotation)
 	configUn = mustToUnstructured(configDep)
 	liveUn = mustToUnstructured(liveDep)
 	res = diff(t, configUn, liveUn, diffOptionsForTest()...)
@@ -381,7 +387,6 @@ func TestThreeWayDiffExample1(t *testing.T) {
 	if ascii != "" {
 		t.Log(ascii)
 	}
-
 }
 
 // Test for ignoring aggregated cluster roles
@@ -498,7 +503,6 @@ func TestThreeWayDiffExplicitNamespace(t *testing.T) {
 }
 
 func TestDiffResourceWithInvalidField(t *testing.T) {
-
 	// Diff(...) should not silently discard invalid fields (fields that are not present in the underlying k8s resource).
 
 	leftDep := `{
@@ -521,35 +525,35 @@ func TestDiffResourceWithInvalidField(t *testing.T) {
 	diffRes := diff(t, &leftUn, rightUn, diffOptionsForTest()...)
 	assert.True(t, diffRes.Modified)
 	ascii, err := printDiff(diffRes)
-	assert.Nil(t, err)
+	require.NoError(t, err)
 
-	assert.True(t, strings.Contains(ascii, "invalidKey"))
+	assert.Contains(t, ascii, "invalidKey")
 	if ascii != "" {
 		t.Log(ascii)
 	}
 }
 
 func TestRemoveNamespaceAnnotation(t *testing.T) {
-	obj := removeNamespaceAnnotation(&unstructured.Unstructured{Object: map[string]interface{}{
-		"metadata": map[string]interface{}{
+	obj := removeNamespaceAnnotation(&unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{
 			"name":      "test",
 			"namespace": "default",
 		},
 	}})
 	assert.Equal(t, "", obj.GetNamespace())
 
-	obj = removeNamespaceAnnotation(&unstructured.Unstructured{Object: map[string]interface{}{
-		"metadata": map[string]interface{}{
+	obj = removeNamespaceAnnotation(&unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{
 			"name":        "test",
 			"namespace":   "default",
-			"annotations": make(map[string]interface{}),
+			"annotations": make(map[string]any),
 		},
 	}})
 	assert.Equal(t, "", obj.GetNamespace())
 	assert.Nil(t, obj.GetAnnotations())
 
-	obj = removeNamespaceAnnotation(&unstructured.Unstructured{Object: map[string]interface{}{
-		"metadata": map[string]interface{}{
+	obj = removeNamespaceAnnotation(&unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{
 			"name":        "test",
 			"namespace":   "default",
 			"annotations": "wrong value",
@@ -698,8 +702,8 @@ func TestNullSecretData(t *testing.T) {
 func TestRedactedSecretData(t *testing.T) {
 	configUn := unmarshalFile("testdata/wordpress-config.json")
 	liveUn := unmarshalFile("testdata/wordpress-live.json")
-	configData := configUn.Object["data"].(map[string]interface{})
-	liveData := liveUn.Object["data"].(map[string]interface{})
+	configData := configUn.Object["data"].(map[string]any)
+	liveData := liveUn.Object["data"].(map[string]any)
 	configData["wordpress-password"] = "++++++++"
 	configData["smtp-password"] = "++++++++"
 	liveData["wordpress-password"] = "++++++++++++"
@@ -745,6 +749,231 @@ func TestUnsortedEndpoints(t *testing.T) {
 	}
 }
 
+func buildGVKParser(t *testing.T) *managedfields.GvkParser {
+	t.Helper()
+	document := &openapi_v2.Document{}
+	require.NoErrorf(t, proto.Unmarshal(testdata.OpenAPIV2Doc, document), "error unmarshaling openapi doc")
+	models, err := openapiproto.NewOpenAPIData(document)
+	require.NoErrorf(t, err, "error building openapi data: %s", err)
+
+	gvkParser, err := managedfields.NewGVKParser(models, false)
+	require.NoErrorf(t, err, "error building gvkParser: %s", err)
+	return gvkParser
+}
+
+func TestStructuredMergeDiff(t *testing.T) {
+	buildParams := func(live, config *unstructured.Unstructured) *SMDParams {
+		gvkParser := buildGVKParser(t)
+		manager := "argocd-controller"
+		return &SMDParams{
+			config:    config,
+			live:      live,
+			gvkParser: gvkParser,
+			manager:   manager,
+		}
+	}
+
+	t.Run("will apply default values", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.ServiceLiveYAML)
+		desiredState := StrToUnstructured(testdata.ServiceConfigYAML)
+		params := buildParams(liveState, desiredState)
+
+		// when
+		result, err := structuredMergeDiff(params)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+		predictedSVC := YamlToSvc(t, result.PredictedLive)
+		liveSVC := YamlToSvc(t, result.NormalizedLive)
+		require.NotNil(t, predictedSVC.Spec.InternalTrafficPolicy)
+		require.NotNil(t, liveSVC.Spec.InternalTrafficPolicy)
+		assert.Equal(t, "Cluster", string(*predictedSVC.Spec.InternalTrafficPolicy))
+		assert.Equal(t, "Cluster", string(*liveSVC.Spec.InternalTrafficPolicy))
+		assert.Empty(t, predictedSVC.Annotations[AnnotationLastAppliedConfig])
+		assert.Empty(t, liveSVC.Annotations[AnnotationLastAppliedConfig])
+	})
+	t.Run("will remove entries in list", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.ServiceLiveYAML)
+		desiredState := StrToUnstructured(testdata.ServiceConfigWith2Ports)
+		params := buildParams(liveState, desiredState)
+
+		// when
+		result, err := structuredMergeDiff(params)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+		svc := YamlToSvc(t, result.PredictedLive)
+		assert.Len(t, svc.Spec.Ports, 2)
+	})
+	t.Run("will remove previously added fields not present in desired state", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.LiveServiceWithTypeYAML)
+		desiredState := StrToUnstructured(testdata.ServiceConfigYAML)
+		params := buildParams(liveState, desiredState)
+
+		// when
+		result, err := structuredMergeDiff(params)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+		svc := YamlToSvc(t, result.PredictedLive)
+		assert.Equal(t, corev1.ServiceTypeClusterIP, svc.Spec.Type)
+	})
+	t.Run("will apply service with multiple ports", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.ServiceLiveYAML)
+		desiredState := StrToUnstructured(testdata.ServiceConfigWithSamePortsYAML)
+		params := buildParams(liveState, desiredState)
+
+		// when
+		result, err := structuredMergeDiff(params)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+		svc := YamlToSvc(t, result.PredictedLive)
+		assert.Len(t, svc.Spec.Ports, 5)
+	})
+	t.Run("will apply deployment defaults correctly", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.DeploymentLiveYAML)
+		desiredState := StrToUnstructured(testdata.DeploymentConfigYAML)
+		params := buildParams(liveState, desiredState)
+
+		// when
+		result, err := structuredMergeDiff(params)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.False(t, result.Modified)
+		deploy := YamlToDeploy(t, result.PredictedLive)
+		assert.Len(t, deploy.Spec.Template.Spec.Containers, 1)
+		assert.Equal(t, "0", deploy.Spec.Template.Spec.Containers[0].Resources.Requests.Cpu().String())
+		assert.Equal(t, "0", deploy.Spec.Template.Spec.Containers[0].Resources.Requests.Memory().String())
+		assert.Equal(t, "0", deploy.Spec.Template.Spec.Containers[0].Resources.Requests.Storage().String())
+		assert.Equal(t, "0", deploy.Spec.Template.Spec.Containers[0].Resources.Limits.Cpu().String())
+		assert.Equal(t, "0", deploy.Spec.Template.Spec.Containers[0].Resources.Limits.Memory().String())
+		assert.Equal(t, "0", deploy.Spec.Template.Spec.Containers[0].Resources.Limits.Storage().String())
+		require.NotNil(t, deploy.Spec.Strategy.RollingUpdate)
+		expectedMaxSurge := &intstr.IntOrString{
+			Type:   intstr.String,
+			StrVal: "25%",
+		}
+		assert.Equal(t, expectedMaxSurge, deploy.Spec.Strategy.RollingUpdate.MaxSurge)
+		assert.Equal(t, "ClusterFirst", string(deploy.Spec.Template.Spec.DNSPolicy))
+	})
+}
+
+func TestServerSideDiff(t *testing.T) {
+	buildOpts := func(predictedLive string) []Option {
+		gvkParser := buildGVKParser(t)
+		manager := "argocd-controller"
+		dryRunner := mocks.NewServerSideDryRunner(t)
+
+		dryRunner.On("Run", mock.Anything, mock.AnythingOfType("*unstructured.Unstructured"), manager).
+			Return(func(_ context.Context, _ *unstructured.Unstructured, _ string) (string, error) {
+				return predictedLive, nil
+			})
+		opts := []Option{
+			WithGVKParser(gvkParser),
+			WithManager(manager),
+			WithServerSideDryRunner(dryRunner),
+		}
+
+		return opts
+	}
+
+	t.Run("will ignore modifications done by mutation webhook by default", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.ServiceLiveYAMLSSD)
+		desiredState := StrToUnstructured(testdata.ServiceConfigYAMLSSD)
+		opts := buildOpts(testdata.ServicePredictedLiveJSONSSD)
+
+		// when
+		result, err := serverSideDiff(desiredState, liveState, opts...)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+		predictedSVC := YamlToSvc(t, result.PredictedLive)
+		liveSVC := YamlToSvc(t, result.NormalizedLive)
+		require.NotNil(t, predictedSVC.Spec.InternalTrafficPolicy)
+		require.NotNil(t, liveSVC.Spec.InternalTrafficPolicy)
+		assert.Equal(t, "Cluster", string(*predictedSVC.Spec.InternalTrafficPolicy))
+		assert.Equal(t, "Cluster", string(*liveSVC.Spec.InternalTrafficPolicy))
+		assert.Empty(t, predictedSVC.Annotations[AnnotationLastAppliedConfig])
+		assert.Empty(t, liveSVC.Annotations[AnnotationLastAppliedConfig])
+		assert.Empty(t, predictedSVC.Labels["event"])
+	})
+
+	t.Run("will test removing some field with undoing changes done by webhook", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.Deployment2LiveYAML)
+		desiredState := StrToUnstructured(testdata.Deployment2ConfigYAML)
+		opts := buildOpts(testdata.Deployment2PredictedLiveJSONSSD)
+
+		// when
+		result, err := serverSideDiff(desiredState, liveState, opts...)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+		predictedDeploy := YamlToDeploy(t, result.PredictedLive)
+		liveDeploy := YamlToDeploy(t, result.NormalizedLive)
+		assert.Len(t, predictedDeploy.Spec.Template.Spec.Containers, 1)
+		assert.Len(t, liveDeploy.Spec.Template.Spec.Containers, 1)
+		assert.Equal(t, "500m", predictedDeploy.Spec.Template.Spec.Containers[0].Resources.Requests.Cpu().String())
+		assert.Equal(t, "512Mi", predictedDeploy.Spec.Template.Spec.Containers[0].Resources.Requests.Memory().String())
+		assert.Equal(t, "500m", liveDeploy.Spec.Template.Spec.Containers[0].Resources.Requests.Cpu().String())
+		assert.Equal(t, "512Mi", liveDeploy.Spec.Template.Spec.Containers[0].Resources.Requests.Memory().String())
+	})
+
+	t.Run("will include mutation webhook modifications", func(t *testing.T) {
+		// given
+		t.Parallel()
+		liveState := StrToUnstructured(testdata.ServiceLiveYAMLSSD)
+		desiredState := StrToUnstructured(testdata.ServiceConfigYAMLSSD)
+		opts := buildOpts(testdata.ServicePredictedLiveJSONSSD)
+		opts = append(opts, WithIgnoreMutationWebhook(false))
+
+		// when
+		result, err := serverSideDiff(desiredState, liveState, opts...)
+
+		// then
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Modified)
+		predictedSVC := YamlToSvc(t, result.PredictedLive)
+		liveSVC := YamlToSvc(t, result.NormalizedLive)
+		require.NotNil(t, predictedSVC.Spec.InternalTrafficPolicy)
+		require.NotNil(t, liveSVC.Spec.InternalTrafficPolicy)
+		assert.Equal(t, "Cluster", string(*predictedSVC.Spec.InternalTrafficPolicy))
+		assert.Equal(t, "Cluster", string(*liveSVC.Spec.InternalTrafficPolicy))
+		assert.Empty(t, predictedSVC.Annotations[AnnotationLastAppliedConfig])
+		assert.Empty(t, liveSVC.Annotations[AnnotationLastAppliedConfig])
+		assert.NotEmpty(t, predictedSVC.Labels["event"])
+	})
+}
+
 func createSecret(data map[string]string) *unstructured.Unstructured {
 	secret := corev1.Secret{TypeMeta: metav1.TypeMeta{Kind: "Secret"}}
 	if data != nil {
@@ -757,7 +986,7 @@ func createSecret(data map[string]string) *unstructured.Unstructured {
 	return mustToUnstructured(&secret)
 }
 
-func secretData(obj *unstructured.Unstructured) map[string]interface{} {
+func secretData(obj *unstructured.Unstructured) map[string]any {
 	data, _, _ := unstructured.NestedMap(obj.Object, "data")
 	return data
 }
@@ -771,31 +1000,296 @@ var (
 func TestHideSecretDataSameKeysDifferentValues(t *testing.T) {
 	target, live, err := HideSecretData(
 		createSecret(map[string]string{"key1": "test", "key2": "test"}),
-		createSecret(map[string]string{"key1": "test-1", "key2": "test-1"}))
+		createSecret(map[string]string{"key1": "test-1", "key2": "test-1"}),
+		nil,
+	)
 	require.NoError(t, err)
 
-	assert.Equal(t, map[string]interface{}{"key1": replacement1, "key2": replacement1}, secretData(target))
-	assert.Equal(t, map[string]interface{}{"key1": replacement2, "key2": replacement2}, secretData(live))
+	assert.Equal(t, map[string]any{"key1": replacement1, "key2": replacement1}, secretData(target))
+	assert.Equal(t, map[string]any{"key1": replacement2, "key2": replacement2}, secretData(live))
 }
 
 func TestHideSecretDataSameKeysSameValues(t *testing.T) {
 	target, live, err := HideSecretData(
 		createSecret(map[string]string{"key1": "test", "key2": "test"}),
-		createSecret(map[string]string{"key1": "test", "key2": "test"}))
+		createSecret(map[string]string{"key1": "test", "key2": "test"}),
+		nil,
+	)
 	require.NoError(t, err)
 
-	assert.Equal(t, map[string]interface{}{"key1": replacement1, "key2": replacement1}, secretData(target))
-	assert.Equal(t, map[string]interface{}{"key1": replacement1, "key2": replacement1}, secretData(live))
+	assert.Equal(t, map[string]any{"key1": replacement1, "key2": replacement1}, secretData(target))
+	assert.Equal(t, map[string]any{"key1": replacement1, "key2": replacement1}, secretData(live))
 }
 
 func TestHideSecretDataDifferentKeysDifferentValues(t *testing.T) {
 	target, live, err := HideSecretData(
 		createSecret(map[string]string{"key1": "test", "key2": "test"}),
-		createSecret(map[string]string{"key2": "test-1", "key3": "test-1"}))
+		createSecret(map[string]string{"key2": "test-1", "key3": "test-1"}),
+		nil,
+	)
 	require.NoError(t, err)
 
-	assert.Equal(t, map[string]interface{}{"key1": replacement1, "key2": replacement1}, secretData(target))
-	assert.Equal(t, map[string]interface{}{"key2": replacement2, "key3": replacement1}, secretData(live))
+	assert.Equal(t, map[string]any{"key1": replacement1, "key2": replacement1}, secretData(target))
+	assert.Equal(t, map[string]any{"key2": replacement2, "key3": replacement1}, secretData(live))
+}
+
+func TestHideStringDataInInvalidSecret(t *testing.T) {
+	liveUn := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Secret",
+			"metadata": map[string]any{
+				"name": "test-secret",
+			},
+			"type": "Opaque",
+			"data": map[string]any{
+				"key1": "a2V5MQ==",
+				"key2": "a2V5MQ==",
+			},
+		},
+	}
+	targetUn := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Secret",
+			"metadata": map[string]any{
+				"name": "test-secret",
+			},
+			"type": "Opaque",
+			"data": map[string]any{
+				"key1": "a2V5MQ==",
+				"key2": "a2V5Mg==",
+				"key3": false,
+			},
+			"stringData": map[string]any{
+				"key4": "key4",
+				"key5": 5,
+			},
+		},
+	}
+
+	liveUn = remarshal(liveUn, applyOptions(diffOptionsForTest()))
+	targetUn = remarshal(targetUn, applyOptions(diffOptionsForTest()))
+
+	target, live, err := HideSecretData(targetUn, liveUn, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]any{"key1": replacement1, "key2": replacement2}, secretData(live))
+	assert.Equal(t, map[string]any{"key1": replacement1, "key2": replacement1, "key3": replacement1, "key4": replacement1, "key5": replacement1}, secretData(target))
+}
+
+// stringData in secrets should be normalized even if it is invalid
+func TestNormalizeSecret(t *testing.T) {
+	tests := []struct {
+		testname   string
+		data       map[string]any
+		stringData map[string]any
+	}{
+		{
+			testname: "Valid secret",
+			data: map[string]any{
+				"key1": "key1",
+			},
+			stringData: map[string]any{
+				"key2": "a2V5Mg==",
+			},
+		},
+		{
+			testname: "Invalid secret",
+			data: map[string]any{
+				"key1": "key1",
+				"key2": 2,
+			},
+			stringData: map[string]any{
+				"key3": "key3",
+				"key4": nil,
+			},
+		},
+		{
+			testname: "Invalid secret with stringData only",
+			data:     nil,
+			stringData: map[string]any{
+				"key3": "key3",
+				"key4": true,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.testname, func(t *testing.T) {
+			un := &unstructured.Unstructured{
+				Object: map[string]any{
+					"apiVersion": "v1",
+					"kind":       "Secret",
+					"metadata": map[string]any{
+						"name": "test-secret",
+					},
+					"type":       "Opaque",
+					"data":       tt.data,
+					"stringData": tt.stringData,
+				},
+			}
+			un = remarshal(un, applyOptions(diffOptionsForTest()))
+
+			NormalizeSecret(un)
+
+			_, found, _ := unstructured.NestedMap(un.Object, "stringData")
+			assert.False(t, found)
+
+			data, found, _ := unstructured.NestedMap(un.Object, "data")
+			assert.True(t, found)
+
+			// check all secret keys are found under data in normalized secret
+			for _, obj := range []map[string]any{tt.data, tt.stringData} {
+				if obj == nil {
+					continue
+				}
+				for k := range obj {
+					_, ok := data[k]
+					assert.True(t, ok)
+				}
+			}
+		})
+	}
+}
+
+func TestHideSecretAnnotations(t *testing.T) {
+	tests := []struct {
+		name           string
+		hideAnnots     map[string]bool
+		annots         map[string]any
+		expectedAnnots map[string]any
+		targetNil      bool
+	}{
+		{
+			name:           "no hidden annotations",
+			hideAnnots:     nil,
+			annots:         map[string]any{"token/value": "secret", "key": "secret-key", "app": "test"},
+			expectedAnnots: map[string]any{"token/value": "secret", "key": "secret-key", "app": "test"},
+		},
+		{
+			name:           "hide annotations",
+			hideAnnots:     map[string]bool{"token/value": true, "key": true},
+			annots:         map[string]any{"token/value": "secret", "key": "secret-key", "app": "test"},
+			expectedAnnots: map[string]any{"token/value": replacement1, "key": replacement1, "app": "test"},
+		},
+		{
+			name:       "hide annotations in last-applied-config",
+			hideAnnots: map[string]bool{"token/value": true, "key": true},
+			annots: map[string]any{
+				"token/value": "secret",
+				"app":         "test",
+				"kubectl.kubernetes.io/last-applied-configuration": `{"apiVersion":"v1","kind":"Secret","metadata":{"annotations":{"app":"test","token/value":"secret","key":"secret-key"},"labels":{"app.kubernetes.io/instance":"test"},"name":"my-secret","namespace":"default"},"type":"Opaque"}`,
+			},
+			expectedAnnots: map[string]any{
+				"token/value": replacement1,
+				"app":         "test",
+				"kubectl.kubernetes.io/last-applied-configuration": `{"apiVersion":"v1","kind":"Secret","metadata":{"annotations":{"app":"test","key":"++++++++","token/value":"++++++++"},"labels":{"app.kubernetes.io/instance":"test"},"name":"my-secret","namespace":"default"},"type":"Opaque"}`,
+			},
+			targetNil: true,
+		},
+		{
+			name:       "special case: hide last-applied-config annotation",
+			hideAnnots: map[string]bool{"kubectl.kubernetes.io/last-applied-configuration": true},
+			annots: map[string]any{
+				"token/value": replacement1,
+				"app":         "test",
+				"kubectl.kubernetes.io/last-applied-configuration": `{"apiVersion":"v1","kind":"Secret","metadata":{"annotations":{"app":"test","token/value":"secret","key":"secret-key"},"labels":{"app.kubernetes.io/instance":"test"},"name":"my-secret","namespace":"default"},"type":"Opaque"}`,
+			},
+			expectedAnnots: map[string]any{
+				"app": "test",
+				"kubectl.kubernetes.io/last-applied-configuration": replacement1,
+			},
+			targetNil: true,
+		},
+		{
+			name:           "hide annotations for malformed annotations",
+			hideAnnots:     map[string]bool{"token/value": true, "key": true},
+			annots:         map[string]any{"token/value": 0, "key": "secret", "app": true},
+			expectedAnnots: map[string]any{"token/value": replacement1, "key": replacement1, "app": true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			unSecret := &unstructured.Unstructured{
+				Object: map[string]any{
+					"apiVersion": "v1",
+					"kind":       "Secret",
+					"metadata": map[string]any{
+						"name":        "test-secret",
+						"annotations": tt.annots,
+					},
+					"type": "Opaque",
+				},
+			}
+
+			liveUn := remarshal(unSecret, applyOptions(diffOptionsForTest()))
+			targetUn := remarshal(unSecret, applyOptions(diffOptionsForTest()))
+
+			if tt.targetNil {
+				targetUn = nil
+			}
+
+			target, live, err := HideSecretData(targetUn, liveUn, tt.hideAnnots)
+			require.NoError(t, err)
+
+			// verify configured annotations are hidden
+			for _, obj := range []*unstructured.Unstructured{target, live} {
+				if obj != nil {
+					annots, _, _ := unstructured.NestedMap(obj.Object, "metadata", "annotations")
+					for ek, ev := range tt.expectedAnnots {
+						v, found := annots[ek]
+						assert.True(t, found)
+						assert.Equal(t, ev, v)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestHideSecretAnnotationsPreserveDifference(t *testing.T) {
+	hideAnnots := map[string]bool{"token/value": true}
+
+	liveUn := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Secret",
+			"metadata": map[string]any{
+				"name":        "test-secret",
+				"annotations": map[string]any{"token/value": "secret", "app": "test"},
+			},
+			"type": "Opaque",
+		},
+	}
+	targetUn := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "v1",
+			"kind":       "Secret",
+			"metadata": map[string]any{
+				"name":        "test-secret",
+				"annotations": map[string]any{"token/value": "new-secret", "app": "test"},
+			},
+			"type": "Opaque",
+		},
+	}
+
+	liveUn = remarshal(liveUn, applyOptions(diffOptionsForTest()))
+	targetUn = remarshal(targetUn, applyOptions(diffOptionsForTest()))
+
+	target, live, err := HideSecretData(targetUn, liveUn, hideAnnots)
+	require.NoError(t, err)
+
+	liveAnnots := live.GetAnnotations()
+	v, found := liveAnnots["token/value"]
+	assert.True(t, found)
+	assert.Equal(t, replacement2, v)
+
+	targetAnnots := target.GetAnnotations()
+	v, found = targetAnnots["token/value"]
+	assert.True(t, found)
+	assert.Equal(t, replacement1, v)
 }
 
 func getTargetSecretJsonBytes() []byte {
@@ -847,11 +1341,8 @@ func getLiveSecretJsonBytes() []byte {
 
 func bytesToUnstructured(t *testing.T, jsonBytes []byte) *unstructured.Unstructured {
 	t.Helper()
-	var jsonMap map[string]interface{}
-	err := json.Unmarshal(jsonBytes, &jsonMap)
-	if err != nil {
-		t.Fatal(err)
-	}
+	var jsonMap map[string]any
+	require.NoError(t, json.Unmarshal(jsonBytes, &jsonMap))
 	return &unstructured.Unstructured{
 		Object: jsonMap,
 	}
@@ -863,14 +1354,14 @@ func TestHideSecretDataHandleEmptySecret(t *testing.T) {
 	liveSecret := bytesToUnstructured(t, getLiveSecretJsonBytes())
 
 	// when
-	target, live, err := HideSecretData(targetSecret, liveSecret)
+	target, live, err := HideSecretData(targetSecret, liveSecret, nil)
 
 	// then
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.NotNil(t, target)
 	assert.NotNil(t, live)
-	assert.Equal(t, nil, target.Object["data"])
-	assert.Equal(t, map[string]interface{}{"namespace": "++++++++", "token": "++++++++"}, secretData(live))
+	assert.Nil(t, target.Object["data"])
+	assert.Equal(t, map[string]any{"namespace": "++++++++", "token": "++++++++"}, secretData(live))
 }
 
 func TestHideSecretDataLastAppliedConfig(t *testing.T) {
@@ -881,15 +1372,14 @@ func TestHideSecretDataLastAppliedConfig(t *testing.T) {
 	require.NoError(t, err)
 	liveSecret.SetAnnotations(map[string]string{corev1.LastAppliedConfigAnnotation: string(lastAppliedStr)})
 
-	target, live, err := HideSecretData(targetSecret, liveSecret)
+	target, live, err := HideSecretData(targetSecret, liveSecret, nil)
 	require.NoError(t, err)
 	err = json.Unmarshal([]byte(live.GetAnnotations()[corev1.LastAppliedConfigAnnotation]), &lastAppliedSecret)
 	require.NoError(t, err)
 
-	assert.Equal(t, map[string]interface{}{"key1": replacement1}, secretData(target))
-	assert.Equal(t, map[string]interface{}{"key1": replacement2}, secretData(live))
-	assert.Equal(t, map[string]interface{}{"key1": replacement3}, secretData(lastAppliedSecret))
-
+	assert.Equal(t, map[string]any{"key1": replacement1}, secretData(target))
+	assert.Equal(t, map[string]any{"key1": replacement2}, secretData(live))
+	assert.Equal(t, map[string]any{"key1": replacement3}, secretData(lastAppliedSecret))
 }
 
 func TestRemarshal(t *testing.T) {
@@ -901,17 +1391,24 @@ metadata:
   name: my-sa
 `)
 	var un unstructured.Unstructured
-	err := yaml.Unmarshal(manifest, &un)
-	assert.NoError(t, err)
+	require.NoError(t, yaml.Unmarshal(manifest, &un))
 	newUn := remarshal(&un, applyOptions(diffOptionsForTest()))
 	_, ok := newUn.Object["imagePullSecrets"]
 	assert.False(t, ok)
-	metadata := newUn.Object["metadata"].(map[string]interface{})
+	metadata := newUn.Object["metadata"].(map[string]any)
 	_, ok = metadata["creationTimestamp"]
 	assert.False(t, ok)
 }
 
 func TestRemarshalResources(t *testing.T) {
+	getRequests := func(un *unstructured.Unstructured) map[string]any {
+		return un.Object["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)["resources"].(map[string]any)["requests"].(map[string]any)
+	}
+
+	setRequests := func(un *unstructured.Unstructured, requests map[string]any) {
+		un.Object["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)["resources"].(map[string]any)["requests"] = requests
+	}
+
 	manifest := []byte(`
 apiVersion: v1
 kind: Pod
@@ -926,15 +1423,27 @@ spec:
         cpu: 0.2
 `)
 	un := unstructured.Unstructured{}
-	err := yaml.Unmarshal(manifest, &un)
-	assert.NoError(t, err)
-	requestsBefore := un.Object["spec"].(map[string]interface{})["containers"].([]interface{})[0].(map[string]interface{})["resources"].(map[string]interface{})["requests"].(map[string]interface{})
-	t.Log(requestsBefore)
-	newUn := remarshal(&un, applyOptions(diffOptionsForTest()))
-	requestsAfter := newUn.Object["spec"].(map[string]interface{})["containers"].([]interface{})[0].(map[string]interface{})["resources"].(map[string]interface{})["requests"].(map[string]interface{})
-	t.Log(requestsAfter)
-	assert.Equal(t, float64(0.2), requestsBefore["cpu"])
-	assert.Equal(t, "200m", requestsAfter["cpu"])
+	require.NoError(t, yaml.Unmarshal(manifest, &un))
+
+	testCases := []struct {
+		name        string
+		cpu         any
+		expectedCPU any
+	}{
+		{"from float", 0.2, "200m"},
+		{"from float64", float64(0.2), "200m"},
+		{"from string", "0.2", "200m"},
+		{"from invalid", "invalid", "invalid"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequests(&un, map[string]any{"cpu": tc.cpu})
+			newUn := remarshal(&un, applyOptions(diffOptionsForTest()))
+			requestsAfter := getRequests(newUn)
+			assert.Equal(t, tc.expectedCPU, requestsAfter["cpu"])
+		})
+	}
 }
 
 func ExampleDiff() {
@@ -988,7 +1497,30 @@ spec:
 
 func diffOptionsForTest() []Option {
 	return []Option{
-		WithLogr(klogr.New()),
+		WithLogr(textlogger.NewLogger(textlogger.NewConfig())),
 		IgnoreAggregatedRoles(false),
 	}
+}
+
+func YamlToSvc(t *testing.T, y []byte) *corev1.Service {
+	t.Helper()
+	svc := corev1.Service{}
+	require.NoErrorf(t, yaml.Unmarshal(y, &svc), "error unmarshaling service bytes")
+	return &svc
+}
+
+func YamlToDeploy(t *testing.T, y []byte) *appsv1.Deployment {
+	t.Helper()
+	deploy := appsv1.Deployment{}
+	require.NoErrorf(t, yaml.Unmarshal(y, &deploy), "error unmarshaling deployment bytes")
+	return &deploy
+}
+
+func StrToUnstructured(yamlStr string) *unstructured.Unstructured {
+	obj := make(map[string]any)
+	err := yaml.Unmarshal([]byte(yamlStr), &obj)
+	if err != nil {
+		panic(err)
+	}
+	return &unstructured.Unstructured{Object: obj}
 }

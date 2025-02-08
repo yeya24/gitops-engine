@@ -3,11 +3,12 @@ package health
 import (
 	"fmt"
 
-	"github.com/argoproj/gitops-engine/pkg/utils/kube"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+
+	"github.com/argoproj/gitops-engine/pkg/utils/kube"
 )
 
 func getReplicaSetHealth(obj *unstructured.Unstructured) (*HealthStatus, error) {
@@ -17,7 +18,7 @@ func getReplicaSetHealth(obj *unstructured.Unstructured) (*HealthStatus, error) 
 		var replicaSet appsv1.ReplicaSet
 		err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, &replicaSet)
 		if err != nil {
-			return nil, fmt.Errorf("failed to convert unstructured ReplicaSet to typed: %v", err)
+			return nil, fmt.Errorf("failed to convert unstructured ReplicaSet to typed: %w", err)
 		}
 		return getAppsv1ReplicaSetHealth(&replicaSet)
 	default:
@@ -42,7 +43,7 @@ func getAppsv1ReplicaSetHealth(replicaSet *appsv1.ReplicaSet) (*HealthStatus, er
 	} else {
 		return &HealthStatus{
 			Status:  HealthStatusProgressing,
-			Message: "Waiting for rollout to finish: observed replica set generation less then desired generation",
+			Message: "Waiting for rollout to finish: observed replica set generation less than desired generation",
 		}, nil
 	}
 

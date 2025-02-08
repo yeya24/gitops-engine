@@ -3,7 +3,8 @@ package kube
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"os"
+	"strings"
 
 	"github.com/go-logr/logr"
 	"golang.org/x/sync/errgroup"
@@ -11,11 +12,14 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/managedfields"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
+	"k8s.io/kube-openapi/pkg/util/proto"
 	"k8s.io/kubectl/pkg/util/openapi"
 
+	"github.com/argoproj/gitops-engine/pkg/diff"
 	utils "github.com/argoproj/gitops-engine/pkg/utils/io"
 	"github.com/argoproj/gitops-engine/pkg/utils/tracing"
 )
@@ -26,10 +30,11 @@ type OnKubectlRunFunc func(command string) (CleanupFunc, error)
 
 type Kubectl interface {
 	ManageResources(config *rest.Config, openAPISchema openapi.Resources) (ResourceOperations, func(), error)
-	LoadOpenAPISchema(config *rest.Config) (openapi.Resources, error)
+	LoadOpenAPISchema(config *rest.Config) (openapi.Resources, *managedfields.GvkParser, error)
 	ConvertToVersion(obj *unstructured.Unstructured, group, version string) (*unstructured.Unstructured, error)
 	DeleteResource(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string, deleteOptions metav1.DeleteOptions) error
 	GetResource(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string) (*unstructured.Unstructured, error)
+	CreateResource(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string, obj *unstructured.Unstructured, createOptions metav1.CreateOptions, subresources ...string) (*unstructured.Unstructured, error)
 	PatchResource(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string, patchType types.PatchType, patchBytes []byte, subresources ...string) (*unstructured.Unstructured, error)
 	GetAPIResources(config *rest.Config, preferred bool, resourceFilter ResourceFilter) ([]APIResourceInfo, error)
 	GetServerVersion(config *rest.Config) (string, error)
@@ -77,7 +82,6 @@ func (k *KubectlCmd) filterAPIResources(config *rest.Config, preferred bool, res
 			gv = schema.GroupVersion{}
 		}
 		for _, apiResource := range apiResourcesList.APIResources {
-
 			if resourceFilter.IsExcludedResource(gv.Group, apiResource.Kind, config.Host) {
 				continue
 			}
@@ -100,23 +104,62 @@ func (k *KubectlCmd) filterAPIResources(config *rest.Config, preferred bool, res
 	return apiResIfs, nil
 }
 
-// isSupportedVerb returns whether or not a APIResource supports a specific verb
+// isSupportedVerb returns whether or not a APIResource supports a specific verb.
+// The verb will be matched case-insensitive.
 func isSupportedVerb(apiResource *metav1.APIResource, verb string) bool {
+	if verb == "" || verb == "*" {
+		return true
+	}
 	for _, v := range apiResource.Verbs {
-		if v == verb {
+		if strings.EqualFold(v, verb) {
 			return true
 		}
 	}
 	return false
 }
 
-func (k *KubectlCmd) LoadOpenAPISchema(config *rest.Config) (openapi.Resources, error) {
+// LoadOpenAPISchema will load all existing resource schemas from the cluster
+// and return:
+// - openapi.Resources: used for getting the proto.Schema from a GVK
+// - managedfields.GvkParser: used for building a ParseableType to be used in
+// structured-merge-diffs
+func (k *KubectlCmd) LoadOpenAPISchema(config *rest.Config) (openapi.Resources, *managedfields.GvkParser, error) {
 	disco, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	oapiGetter := openapi.NewOpenAPIGetter(disco)
+	oapiResources, err := openapi.NewOpenAPIParser(oapiGetter).Parse()
+	if err != nil {
+		return nil, nil, fmt.Errorf("error getting openapi resources: %w", err)
+	}
+	gvkParser, err := k.newGVKParser(oapiGetter)
+	if err != nil {
+		return oapiResources, nil, fmt.Errorf("error getting gvk parser: %w", err)
+	}
+	return oapiResources, gvkParser, nil
+}
+
+func (k *KubectlCmd) newGVKParser(oapiGetter discovery.OpenAPISchemaInterface) (*managedfields.GvkParser, error) {
+	doc, err := oapiGetter.OpenAPISchema()
+	if err != nil {
+		return nil, fmt.Errorf("error getting openapi schema: %w", err)
+	}
+	models, err := proto.NewOpenAPIData(doc)
+	if err != nil {
+		return nil, fmt.Errorf("error getting openapi data: %w", err)
+	}
+	var taintedGVKs []schema.GroupVersionKind
+	models, taintedGVKs = newUniqueModels(models)
+	if len(taintedGVKs) > 0 {
+		k.Log.Info("Duplicate GVKs detected in OpenAPI schema. This could cause inaccurate diffs.", "gvks", taintedGVKs)
+	}
+	gvkParser, err := managedfields.NewGVKParser(models, false)
 	if err != nil {
 		return nil, err
 	}
-
-	return openapi.NewOpenAPIParser(openapi.NewOpenAPIGetter(disco)).Parse()
+	return gvkParser, nil
 }
 
 func (k *KubectlCmd) GetAPIResources(config *rest.Config, preferred bool, resourceFilter ResourceFilter) ([]APIResourceInfo, error) {
@@ -145,13 +188,36 @@ func (k *KubectlCmd) GetResource(ctx context.Context, config *rest.Config, gvk s
 	if err != nil {
 		return nil, err
 	}
-	apiResource, err := ServerResourceForGroupVersionKind(disco, gvk)
+	apiResource, err := ServerResourceForGroupVersionKind(disco, gvk, "get")
 	if err != nil {
 		return nil, err
 	}
 	resource := gvk.GroupVersion().WithResource(apiResource.Name)
 	resourceIf := ToResourceInterface(dynamicIf, apiResource, resource, namespace)
 	return resourceIf.Get(ctx, name, metav1.GetOptions{})
+}
+
+// CreateResource creates resource
+func (k *KubectlCmd) CreateResource(ctx context.Context, config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string, obj *unstructured.Unstructured, createOptions metav1.CreateOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	span := k.Tracer.StartSpan("CreateResource")
+	span.SetBaggageItem("kind", gvk.Kind)
+	span.SetBaggageItem("name", name)
+	defer span.Finish()
+	dynamicIf, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	disco, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	apiResource, err := ServerResourceForGroupVersionKind(disco, gvk, "create")
+	if err != nil {
+		return nil, err
+	}
+	resource := gvk.GroupVersion().WithResource(apiResource.Name)
+	resourceIf := ToResourceInterface(dynamicIf, apiResource, resource, namespace)
+	return resourceIf.Create(ctx, obj, createOptions, subresources...)
 }
 
 // PatchResource patches resource
@@ -168,7 +234,7 @@ func (k *KubectlCmd) PatchResource(ctx context.Context, config *rest.Config, gvk
 	if err != nil {
 		return nil, err
 	}
-	apiResource, err := ServerResourceForGroupVersionKind(disco, gvk)
+	apiResource, err := ServerResourceForGroupVersionKind(disco, gvk, "patch")
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +257,7 @@ func (k *KubectlCmd) DeleteResource(ctx context.Context, config *rest.Config, gv
 	if err != nil {
 		return err
 	}
-	apiResource, err := ServerResourceForGroupVersionKind(disco, gvk)
+	apiResource, err := ServerResourceForGroupVersionKind(disco, gvk, "delete")
 	if err != nil {
 		return err
 	}
@@ -206,14 +272,15 @@ func (k *KubectlCmd) DeleteResource(ctx context.Context, config *rest.Config, gv
 }
 
 func (k *KubectlCmd) ManageResources(config *rest.Config, openAPISchema openapi.Resources) (ResourceOperations, func(), error) {
-	f, err := ioutil.TempFile(utils.TempDir, "")
+	f, err := os.CreateTemp(utils.TempDir, "")
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate temp file for kubeconfig: %v", err)
+		return nil, nil, fmt.Errorf("failed to generate temp file for kubeconfig: %w", err)
 	}
 	_ = f.Close()
 	err = WriteKubeConfig(config, "", f.Name())
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to write kubeconfig: %v", err)
+		utils.DeleteFile(f.Name())
+		return nil, nil, fmt.Errorf("failed to write kubeconfig: %w", err)
 	}
 	fact := kubeCmdFactory(f.Name(), "", config)
 	cleanup := func() {
@@ -226,6 +293,31 @@ func (k *KubectlCmd) ManageResources(config *rest.Config, openAPISchema openapi.
 		tracer:        k.Tracer,
 		log:           k.Log,
 		onKubectlRun:  k.OnKubectlRun,
+	}, cleanup, nil
+}
+
+func ManageServerSideDiffDryRuns(config *rest.Config, openAPISchema openapi.Resources, tracer tracing.Tracer, log logr.Logger, onKubectlRun OnKubectlRunFunc) (diff.KubeApplier, func(), error) {
+	f, err := os.CreateTemp(utils.TempDir, "")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate temp file for kubeconfig: %w", err)
+	}
+	_ = f.Close()
+	err = WriteKubeConfig(config, "", f.Name())
+	if err != nil {
+		utils.DeleteFile(f.Name())
+		return nil, nil, fmt.Errorf("failed to write kubeconfig: %w", err)
+	}
+	fact := kubeCmdFactory(f.Name(), "", config)
+	cleanup := func() {
+		utils.DeleteFile(f.Name())
+	}
+	return &kubectlServerSideDiffDryRunApplier{
+		config:        config,
+		fact:          fact,
+		openAPISchema: openAPISchema,
+		tracer:        tracer,
+		log:           log,
+		onKubectlRun:  onKubectlRun,
 	}, cleanup, nil
 }
 
